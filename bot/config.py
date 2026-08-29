@@ -33,7 +33,7 @@ KRAKEN_API_KEY = os.getenv("KRAKEN_API_KEY", "")
 KRAKEN_API_SECRET = os.getenv("KRAKEN_API_SECRET", "")
 
 # Starting balance for the paper-trading simulator (USD).
-PAPER_STARTING_BALANCE = float(os.getenv("PAPER_STARTING_BALANCE", "25000"))
+PAPER_STARTING_BALANCE = float(os.getenv("PAPER_STARTING_BALANCE", "1000"))
 
 # Kraken Spot has no margin/short-selling in this bot -- "short" entry alerts
 # are logged and skipped rather than acted on. Flip this only if you've set
