@@ -26,8 +26,13 @@
 //      same % of equity regardless of how far the stop sits from entry.
 //
 // Only one position at a time (pyramiding=0). Works on any intraday
-// timeframe. For 24/7 markets (crypto), leave "Restrict entries to session"
-// and "Compute prior day high/low from regular session only" both off.
+// timeframe. Breakouts/entries default to restricted to the first 90
+// minutes after the open (09:30-11:00) since that's where ORB setups get
+// the volume/liquidity to actually follow through - adjust the session
+// input for a different market's open, or turn "Restrict breakouts/entries
+// to session window" off to trade breakouts at any time of day. For 24/7
+// markets (crypto), also leave "Compute prior day high/low from regular
+// session only" off.
 //
 // This script is a fresh, original strategy — unrelated to
 // pine/ProScalpv3.7.pine and not wired into bot/.
@@ -66,8 +71,9 @@ riskPercentPerTrade = input.float(1.0, "Risk per trade (% of equity)", step=0.25
 stopBufferAtrMult   = input.float(0.15, "Stop buffer beyond retest high/low (x ATR)", step=0.05, minval=0, group=grpExit)
 rewardMultiple      = input.float(2.0, "Reward:Risk multiple (R)", step=0.5, minval=0.5, group=grpExit)
 
-useSession   = input.bool(false, "Restrict entries to session", group=grpSess)
-sessionInput = input.session("0930-1600", "Session (exchange time)", group=grpSess)
+useSession   = input.bool(true, "Restrict breakouts/entries to session window", group=grpSess,
+     tooltip="ORB edges come from the volume/liquidity right after the open - defaults to the first 90 minutes of US market hours (09:30-11:00). Turn off only if you specifically want to trade breakouts at any time of day.")
+sessionInput = input.session("0930-1100", "Session (exchange time, e.g. first 90 min after open)", group=grpSess)
 
 showLevels        = input.bool(true, "Plot prior day high/low", group=grpDisp)
 showSetupMarkers  = input.bool(true, "Show breakout/retest markers", group=grpDisp)
@@ -119,7 +125,7 @@ else
 breakoutUpEvent   = false
 breakoutDownEvent = false
 
-if state == 0
+if state == 0 and inSession
     if allowLongs and not na(pdh) and ta.crossover(close, pdh) and (close - pdh) >= minBreakoutAtrMult * atrVal
         state := 1
         breakoutLevel := pdh
@@ -142,7 +148,7 @@ if state == 1
         // Gave the whole breakout back before ever retesting - setup failed.
         state := 0
         barsInState := 0
-    else if low <= breakoutLevel + retestToleranceAtrMult * atrVal
+    else if inSession and low <= breakoutLevel + retestToleranceAtrMult * atrVal
         longRetestSignal := true
     else if barsInState >= maxWaitBars
         state := 0
@@ -153,7 +159,7 @@ if state == 2
     if close > breakoutLevel
         state := 0
         barsInState := 0
-    else if high >= breakoutLevel - retestToleranceAtrMult * atrVal
+    else if inSession and high >= breakoutLevel - retestToleranceAtrMult * atrVal
         shortRetestSignal := true
     else if barsInState >= maxWaitBars
         state := 0
