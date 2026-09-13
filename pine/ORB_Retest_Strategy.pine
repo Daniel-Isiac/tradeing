@@ -98,7 +98,7 @@ var float pdl     = na
 var float dayHigh = na
 var float dayLow  = na
 
-isNewDay = ta.change(time("D"))
+isNewDay = ta.change(time("D")) != 0
 
 if isNewDay
     pdh := dayHigh
