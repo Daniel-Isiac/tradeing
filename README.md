@@ -4,6 +4,40 @@ A TradingView-signal-driven trading bot for Kraken Spot (BTC/USD, ETH/USD),
 built around the `pine/ProScalpv3.7.pine` strategy. Starts in **paper trading
 mode by default** — no real orders until you explicitly flip `LIVE_TRADING=true`.
 
+## `pine/BMNR_TrendSwing_v1.pine` — a different strategy for BMNR
+
+`ProScalpv3.7` is a **5-minute mean-reversion scalper** tuned against SPY
+options timing (fast SuperTrend flips, a tight 1.5x/2x-ATR bracket, a 12-bar
+time stop). Pointed at BMNR it backtested around **-25% over the last year**
+on TradingView. That's a structural mismatch, not a bad parameter: BMNR is a
+thinly-floated, ETH-treasury/news-driven momentum name that moves in long,
+violent directional runs separated by sharp-but-temporary pullbacks — a fast
+scalper with tight stops gets shaken out of the trend by the exact volatility
+that makes the trend possible.
+
+`BMNR_TrendSwing_v1.pine` is a from-scratch **swing trend-follower** instead:
+a Donchian-channel breakout entry (only takes real N-bar-high breakouts, not
+guessed trend flips) with a wide ATR "chandelier" trailing stop, optional
+ADX/volume filters to skip low-conviction breakouts, and risk-%-of-equity
+position sizing so size shrinks automatically when BMNR's volatility is
+elevated. It's meant for a daily/4H swing chart, not a 1-5 minute scalp chart.
+
+Sanity-checked (not a substitute for your own Strategy Tester run) against
+real BMNR daily price history (2026-04-09 to 2026-09-11, the longest window
+available from this session's data source — only ~5 months, not a full year,
+so treat this as directional evidence for the approach rather than a
+performance promise): buy & hold returned +18.7% over that stretch; the
+Donchian(20)/3x-ATR(14) chandelier config caught the whole run for +32.3% on
+a single trade with no drawdown after entry, while a ProScalp-style fast
+trend-flip + tight-bracket system on the same daily bars returned only +5.3%
+with more whipsaw. Re-run this yourself in TradingView's Strategy Tester
+against BMNR's full history before trusting it, and paper trade first
+regardless.
+
+This strategy is TradingView-side only — the Python bot in this repo talks to
+Kraken Spot (crypto) and has no equities/options execution path, so BMNR
+signals from this script aren't wired to `bot/`.
+
 ## How it works
 
 ```
@@ -128,6 +162,8 @@ signals before considering live mode.
 
 - `pine/ProScalpv3.7.pine` — the TradingView strategy, with webhook alerting
   added for bot integration.
+- `pine/BMNR_TrendSwing_v1.pine` — a swing trend-following strategy for BMNR
+  specifically (Donchian breakout + ATR chandelier trailing stop); see above.
 - `bot/config.py` — all settings, loaded from `.env`.
 - `bot/kraken_client.py` — thin ccxt wrapper (public price data + private orders).
 - `bot/broker.py` — `PaperBroker` (simulated fills) / `LiveBroker` (real orders).

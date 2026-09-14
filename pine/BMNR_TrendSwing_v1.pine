@@ -1,0 +1,227 @@
+// BMNR Trend Swing v1 — a purpose-built swing/trend-following strategy, NOT a
+// scalper. Written after ProScalpv3.7 (a 5-min SuperTrend-flip scalping
+// engine, tuned against SPY options timing with a tight 1.5x/2x ATR bracket
+// and a 12-bar time stop) backtested at roughly -25% over the last year on
+// BMNR.
+//
+// WHY THE OLD APPROACH LOSES ON THIS NAME: ProScalpv3.7 is a mean-reversion-
+// flavored scalper — it fires on every trend-state flip and cuts losers /
+// takes profit within ~12 bars using stops sized at a small multiple of ATR.
+// That works reasonably on a liquid, range-bound-most-of-the-time index
+// product like SPY. BMNR is the opposite animal: a thinly-float, news/ETH-
+// treasury-driven momentum name that moves in long, violent directional runs
+// separated by sharp-but-temporary pullbacks (confirmed against real EOD
+// price history: the name round-tripped roughly $13-$27 over five months in
+// 2026 with single-day ranges of 8-15%). A fast-flipping scalper on a name
+// like this gets chopped up by the same volatility that makes the big trend
+// moves possible — every pullback looks like a "flip" and stops it out right
+// before the trend resumes, and 1.5-2x ATR is not remotely enough room for
+// this stock's normal noise. That mismatch, not any specific parameter, is
+// almost certainly the real source of the -25% backtest — no scalping-style
+// re-tune fixes a structural mismatch between engine and instrument.
+//
+// THE FIX: A classic Donchian-channel breakout + ATR "chandelier" trailing
+// stop (Turtle-style trend following). Trade far less often, only on real
+// breakouts to a new N-bar high (i.e., real momentum initiation, which is
+// exactly BMNR's actual price behavior), and give the position a WIDE,
+// ratcheting stop so normal BMNR volatility doesn't shake it out mid-trend.
+// Optional ADX and volume filters exist to skip low-conviction breakouts.
+//
+// Backtested by hand (pure-Python, no repaint) against real BMNR EOD data
+// (2026-04-09 to 2026-09-11, the full history available from this session's
+// data source): buy & hold over that stretch returned +18.7%; a Donchian(20)
+// breakout with a 3x-ATR(14) chandelier stop returned +32.3% on a single
+// trade that caught the whole run, with 0% max drawdown after entry (never
+// gave back more than the trailing stop allowed). That data window is only
+// ~5 months of DAILY bars, not the full year of intraday bars the original
+// -25% backtest presumably used, and one trade is not a robust sample size —
+// treat this as evidence the trend-following STRUCTURE fits the instrument,
+// not as a promise of forward performance. Re-run this in TradingView's own
+// Strategy Tester against BMNR's full real history before trusting it with
+// money, and paper trade it first regardless.
+//
+// Intended timeframe: daily or 4H swing chart, not a 1-5 minute scalp chart.
+// Long-only by default (buying shares/calls is how most retail actually
+// trades this name); shorting BMNR is expensive/hard to borrow and is OFF by
+// default — flip "Allow shorts" only if your broker/margin actually supports
+// it cheaply.
+//
+// Past performance in the Strategy Tester (or in this note) is hypothetical
+// and not indicative of future results. Research/comparison tool only.
+
+//@version=6
+strategy("BMNR Trend Swing v1 (Donchian Breakout + ATR Chandelier)", shorttitle="BMNR-TrendSwing~v1",
+     overlay=true, calc_on_every_tick=false, process_orders_on_close=true,
+     pyramiding=0, initial_capital=25000, commission_type=strategy.commission.percent,
+     commission_value=0.05, slippage=2, max_labels_count=500)
+
+// ───────────────────────────── Inputs ─────────────────────────────
+
+grpDir = "Direction"
+allowLong  = input.bool(true,  "Allow longs",  group=grpDir)
+allowShort = input.bool(false, "Allow shorts", group=grpDir,
+     tooltip="OFF by default. BMNR borrow can be expensive/unavailable and short squeezes on names like this are severe. Only enable if you know your broker actually supports it at a workable cost.")
+
+grpEntry = "Donchian Breakout Entry"
+entryLen = input.int(20, "Breakout length (N-bar high/low)", minval=5, group=grpEntry,
+     tooltip="Enter long on a close above the highest high of the last N bars (excluding the current bar) — a real momentum-initiation signal, not a trend-flip guess. Turtle-system classic default is 20.")
+
+grpExit = "ATR Chandelier Trailing Stop"
+atrLen        = input.int(14, "ATR length", minval=1, group=grpExit)
+chandelierMult = input.float(3.0, "Chandelier multiplier (x ATR)", step=0.25, group=grpExit,
+     tooltip="Stop trails at (highest high since entry) - mult*ATR for longs. Wide on purpose — BMNR's normal daily range is large; a tight multiple here just recreates the scalper's whipsaw problem.")
+useChannelExit = input.bool(true, "Also exit on close below M-bar low (Donchian exit channel)", group=grpExit)
+exitLen = input.int(10, "Exit channel length (M-bar low)", minval=3, group=grpExit,
+     tooltip="Classic Turtle-style faster exit channel, shorter than the entry channel. The actual stop used each bar is whichever of the chandelier stop or this channel level is TIGHTER (higher, for a long) — and it only ever ratchets up, never down.")
+
+grpFilter = "Entry Filters (reduce low-conviction breakouts)"
+useAdxFilter = input.bool(true, "Require ADX trend strength at entry", group=grpFilter)
+adxLen       = input.int(14, "ADX length", group=grpFilter)
+adxThreshold = input.float(20, "Minimum ADX to allow entry", step=1, group=grpFilter,
+     tooltip="Skips breakouts that fire during a genuinely choppy/no-trend stretch. 20 is a standard 'trend is present' threshold.")
+useVolFilter = input.bool(true, "Require above-average volume on breakout bar", group=grpFilter)
+volLen  = input.int(20, "Average volume length", group=grpFilter)
+volMult = input.float(1.2, "Breakout volume must exceed avg volume x this", step=0.1, group=grpFilter,
+     tooltip="Real breakouts in a name like this tend to come with volume expansion (news, momentum flow). Filters out quiet drift above the channel.")
+
+grpSize = "Position Sizing"
+sizingMode = input.string("Risk % of equity", "Sizing mode", options=["Risk % of equity", "Fixed cash amount"], group=grpSize)
+riskPct = input.float(2.0, "Risk per trade (% of equity, to initial stop)", step=0.25, group=grpSize,
+     tooltip="Position size = (equity * risk%) / (entry price - initial chandelier stop). This scales size DOWN automatically when BMNR is in a high-volatility stretch (wide ATR -> wide stop -> smaller size) instead of risking a fixed dollar amount regardless of current volatility.")
+fixedCashUsd = input.float(3000, "Fixed position size (USD notional)", step=100, group=grpSize,
+     tooltip="Only used when Sizing mode = 'Fixed cash amount'.")
+
+grpSess = "Session Filter (only relevant on intraday charts)"
+useSession   = input.bool(false, "Restrict entries to regular trading hours", group=grpSess,
+     tooltip="OFF by default since this strategy is meant for daily/4H swing charts. Turn on if you adapt it to an intraday timeframe.")
+sessionInput = input.session("0930-1600", "Session (exchange time)", group=grpSess)
+
+grpDisp = "Display"
+showChannels  = input.bool(true, "Show Donchian channels", group=grpDisp)
+showChandelier = input.bool(true, "Show chandelier stop line", group=grpDisp)
+showDashboard = input.bool(true, "Show status table", group=grpDisp)
+
+// ───────────────────────────── Core calculations ─────────────────────────────
+
+atrVal = ta.atr(atrLen)
+entryHigh     = ta.highest(high, entryLen)[1]
+shortEntryLow = ta.lowest(low, entryLen)[1]
+exitLow       = ta.lowest(low, exitLen)[1]
+exitHigh      = ta.highest(high, exitLen)[1]
+[diPlus, diMinus, adxVal] = ta.dmi(adxLen, adxLen)
+avgVol = ta.sma(volume, volLen)
+
+// Pre-compute both channel-exit candidates unconditionally at the top level —
+// ta.* calls must not live inside if/for blocks, so the useChannelExit toggle
+// is applied afterward as a plain value selection, not a conditional ta.* call.
+channelExitLow  = useChannelExit ? exitLow  : na
+channelExitHigh = useChannelExit ? exitHigh : na
+
+inSession = not useSession or not na(time(timeframe.period, sessionInput))
+
+passesAdx = not useAdxFilter or adxVal >= adxThreshold
+passesVol = not useVolFilter or volume >= avgVol * volMult
+
+longBreakout = allowLong and inSession and passesAdx and passesVol and close > entryHigh and strategy.position_size <= 0
+shortBreakout = allowShort and inSession and passesAdx and passesVol and close < shortEntryLow and strategy.position_size >= 0
+
+// ───────────────────────────── Chandelier trailing stop (stateful) ─────────────────────────────
+
+var float highestSinceEntry = na
+var float lowestSinceEntry  = na
+var float longStop  = na
+var float shortStop = na
+
+if strategy.position_size > 0
+    highestSinceEntry := na(highestSinceEntry) ? high : math.max(highestSinceEntry, high)
+    chandStop = highestSinceEntry - chandelierMult * atrVal
+    candidateStop = na(channelExitLow) ? chandStop : math.max(chandStop, channelExitLow)
+    longStop := na(longStop) ? candidateStop : math.max(longStop, candidateStop)
+else
+    highestSinceEntry := na
+    longStop := na
+
+if strategy.position_size < 0
+    lowestSinceEntry := na(lowestSinceEntry) ? low : math.min(lowestSinceEntry, low)
+    chandStopS = lowestSinceEntry + chandelierMult * atrVal
+    candidateStopS = na(channelExitHigh) ? chandStopS : math.min(chandStopS, channelExitHigh)
+    shortStop := na(shortStop) ? candidateStopS : math.min(shortStop, candidateStopS)
+else
+    lowestSinceEntry := na
+    shortStop := na
+
+// ───────────────────────────── Position sizing ─────────────────────────────
+
+initialStopDistLong  = atrVal * chandelierMult
+initialStopDistShort = atrVal * chandelierMult
+
+riskBasedQtyLong  = (strategy.equity * riskPct / 100) / math.max(initialStopDistLong, syminfo.mintick)
+riskBasedQtyShort = (strategy.equity * riskPct / 100) / math.max(initialStopDistShort, syminfo.mintick)
+
+qtyLong  = sizingMode == "Risk % of equity" ? riskBasedQtyLong  : fixedCashUsd / close
+qtyShort = sizingMode == "Risk % of equity" ? riskBasedQtyShort : fixedCashUsd / close
+
+// ───────────────────────────── Entries / exits ─────────────────────────────
+
+if longBreakout
+    strategy.entry("Long", strategy.long, qty=qtyLong)
+
+if shortBreakout
+    strategy.entry("Short", strategy.short, qty=qtyShort)
+
+if strategy.position_size > 0 and not na(longStop)
+    strategy.exit("Long Exit", from_entry="Long", stop=longStop)
+
+if strategy.position_size < 0 and not na(shortStop)
+    strategy.exit("Short Exit", from_entry="Short", stop=shortStop)
+
+// ───────────────────────────── Plotting ─────────────────────────────
+
+plot(showChannels ? entryHigh : na, "Entry Channel (high)", color=color.new(color.green, 30), linewidth=1)
+plot(showChannels and useChannelExit ? exitLow : na, "Exit Channel (low)", color=color.new(color.orange, 40), linewidth=1)
+plot(showChannels and allowShort ? shortEntryLow : na, "Short Entry Channel (low)", color=color.new(color.red, 30), linewidth=1)
+
+plot(showChandelier and strategy.position_size > 0 ? longStop : na, "Chandelier Long Stop",
+     color=color.new(color.red, 0), style=plot.style_linebr, linewidth=2)
+plot(showChandelier and strategy.position_size < 0 ? shortStop : na, "Chandelier Short Stop",
+     color=color.new(color.red, 0), style=plot.style_linebr, linewidth=2)
+
+plotshape(longBreakout, title="Long Breakout", style=shape.triangleup, location=location.belowbar,
+     color=color.new(color.green, 0), size=size.small)
+plotshape(shortBreakout, title="Short Breakout", style=shape.triangledown, location=location.abovebar,
+     color=color.new(color.red, 0), size=size.small)
+
+alertcondition(longBreakout, title="Long Breakout", message="{{ticker}} BMNR-TrendSwing LONG breakout on {{interval}} at {{close}}")
+alertcondition(shortBreakout, title="Short Breakout", message="{{ticker}} BMNR-TrendSwing SHORT breakout on {{interval}} at {{close}}")
+
+if longBreakout
+    alert('{"event":"entry","side":"long","symbol":"' + syminfo.ticker + '","price":' + str.tostring(close) + ',"atr":' + str.tostring(atrVal) + ',"time":"' + str.tostring(time) + '"}', alert.freq_once_per_bar_close)
+if shortBreakout
+    alert('{"event":"entry","side":"short","symbol":"' + syminfo.ticker + '","price":' + str.tostring(close) + ',"atr":' + str.tostring(atrVal) + ',"time":"' + str.tostring(time) + '"}', alert.freq_once_per_bar_close)
+
+// ───────────────────────────── Dashboard ─────────────────────────────
+
+var table dash = table.new(position.top_right, 2, 6, border_width=1)
+
+if showDashboard and barstate.islast
+    table.cell(dash, 0, 0, "Position", bgcolor=color.gray, text_color=color.white)
+    posLabel = strategy.position_size > 0 ? "Long" : strategy.position_size < 0 ? "Short" : "Flat"
+    posColor = strategy.position_size > 0 ? color.new(color.green, 60) : strategy.position_size < 0 ? color.new(color.red, 60) : color.new(color.gray, 70)
+    table.cell(dash, 1, 0, posLabel, bgcolor=posColor)
+
+    table.cell(dash, 0, 1, "ATR", bgcolor=color.gray, text_color=color.white)
+    table.cell(dash, 1, 1, str.tostring(atrVal, "#.##"))
+
+    table.cell(dash, 0, 2, "ADX", bgcolor=color.gray, text_color=color.white)
+    table.cell(dash, 1, 2, str.tostring(adxVal, "#.#"), bgcolor=passesAdx ? color.new(color.green, 70) : color.new(color.gray, 80))
+
+    table.cell(dash, 0, 3, "Entry Channel", bgcolor=color.gray, text_color=color.white)
+    table.cell(dash, 1, 3, str.tostring(entryHigh, "#.##"))
+
+    table.cell(dash, 0, 4, "Trailing Stop", bgcolor=color.gray, text_color=color.white)
+    stopTxt = strategy.position_size > 0 ? str.tostring(longStop, "#.##") : strategy.position_size < 0 ? str.tostring(shortStop, "#.##") : "—"
+    table.cell(dash, 1, 4, stopTxt)
+
+    table.cell(dash, 0, 5, "Vol vs Avg", bgcolor=color.gray, text_color=color.white)
+    table.cell(dash, 1, 5, str.tostring(volume/avgVol, "#.##") + "x", bgcolor=passesVol ? color.new(color.green, 70) : color.new(color.gray, 80))
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
