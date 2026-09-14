@@ -1,0 +1,413 @@
+// ORB Retest Strategy — break of prior day high/low, then enter on the retest.
+//
+// Logic (4 stages, re-armed independently every time the state resets to idle):
+//   1. TRACK LEVELS — the prior completed day's high (PDH) and low (PDL) are
+//      tracked live from the current chart's own bars (no higher-timeframe
+//      request.security lookahead needed), so they update once per new day
+//      and never repaint.
+//   2. CLEAN BREAKOUT — a bar's close must cross above PDH (or below PDL) by
+//      at least `minBreakoutAtrMult` x ATR beyond the level, AND (optionally)
+//      agree with session VWAP. That's what makes it a "clean" break instead
+//      of a one-tick poke through the level during a move that's actually
+//      reversing. Once this fires, the setup is "armed" and waits for a
+//      retest — no new breakout is looked for until this one resolves
+//      (enters, fails, or times out).
+//   3. RETEST — while armed, if price closes back through the level entirely
+//      (giving the breakout back), the setup is cancelled. If instead price
+//      pulls back and tags the level (within `retestToleranceAtrMult` x ATR)
+//      while still closing back beyond it, that's the retest holding as
+//      new support/resistance -> entry signal. A setup that neither resolves
+//      nor times out within `maxWaitBars` is cancelled.
+//   4. ENTRY / STOP / EXIT — enters at the retest bar's close. Stop is placed
+//      just beyond that bar's low (longs) or high (shorts), padded by
+//      `stopBufferAtrMult` x ATR. Position size is derived from
+//      `riskPercentPerTrade` of current equity divided by the per-unit risk,
+//      so every trade risks the same % of equity regardless of how far the
+//      stop sits from entry. The exit itself is scale-out + trail by default
+//      (see v2 notes below), or a single fixed R-multiple target if you turn
+//      that off.
+//
+// Only one position at a time (pyramiding=0). Works on any intraday
+// timeframe. Breakouts/entries default to restricted to the first 90
+// minutes after the open (09:30-11:00) since that's where ORB setups get
+// the volume/liquidity to actually follow through - adjust the session
+// input for a different market's open, or turn "Restrict breakouts/entries
+// to session window" off to trade breakouts at any time of day. For 24/7
+// markets (crypto), also leave "Compute prior day high/low from regular
+// session only" off.
+//
+// v2 FIXES (from reviewing two backtested PLTR 1-min trades that both landed
+// on the wrong side of the same violent intraday reversal):
+//   1. FIXED R TARGET CAPPED A WINNER — the short in that pair closed at a
+//      flat 2R limit right as the real continuation move was just getting
+//      going, banking a small win and leaving the much larger subsequent
+//      drop uncaptured. Root cause: a single `strategy.exit(stop=, limit=)`
+//      closes the WHOLE position the instant the fixed target is touched,
+//      with no way to keep riding a trend day. Fixed by replacing it with
+//      scale-out + trail (below) so the strategy still books partial profit
+//      early but lets a real trend run for the remainder.
+//   2. THIN BREAKOUT FILTER — minBreakoutAtrMult defaulted to 0.1x ATR. On a
+//      1-min chart with a small ATR, this is easily cleared by ordinary
+//      noise, so the "clean breakout" gate wasn't filtering much. Default
+//      raised to 0.3x ATR.
+//   3. NO TREND CHECK — a PDH-retest long could arm even if the broader move
+//      was actually rolling over (that's what happened to the long in that
+//      pair, stopped out right before a hard breakdown). Added an optional
+//      session-VWAP alignment filter: longs only arm above VWAP, shorts only
+//      below it.
+//   4. EXECUTION-PRICE MISMATCH — the strategy computed stop/target/qty off
+//      the signal bar's `close`, but without `process_orders_on_close=true`
+//      Pine fills market orders at the NEXT bar's open, not that close. On a
+//      fast-moving 1-min name that's real, unaccounted-for slippage between
+//      the assumed and actual fill price. Added `process_orders_on_close=true`
+//      (matches how the other two strategies in this repo already work) so
+//      the fill lines up with the bar the stop/target math was based on.
+//
+// SCALE-OUT + TRAIL EXIT (new default exit model): at entry, a limit order
+// closes `partialPct`% of the position at `partialAtRMultiple` x the initial
+// risk (banks profit early). Once that partial fills, the stop for the
+// remaining runner moves to breakeven (optional) and then trails by
+// `trailAtrMult` x ATR off the highest high (longs) / lowest low (shorts)
+// since entry — ratcheting only in the trade's favor, same mechanism as
+// pine/BMNR_TrendSwing_v1.pine's chandelier stop. A distant `hardCapRMultiple`
+// limit order remains as a safety backstop in case of a gap the trailing
+// stop can't react to intrabar. Turn `usePartialAndTrail` off to fall back
+// to the original single fixed-R exit.
+//
+// Past performance in the Strategy Tester is hypothetical and not indicative
+// of future results. Research/comparison tool only.
+
+//@version=6
+strategy("ORB Retest Strategy v2 (Break of Prior Day High/Low + Retest Entry, Scale-Out/Trail)",
+     shorttitle="ORB Retest v2", overlay=true, initial_capital=10000, currency=currency.USD,
+     commission_type=strategy.commission.percent, commission_value=0.05, slippage=1,
+     pyramiding=0, calc_on_every_tick=false, process_orders_on_close=true)
+
+// ───────────────────────────── Inputs ─────────────────────────────
+
+grpLevels = "Prior Day Levels"
+grpBreak  = "Breakout Filter"
+grpTrend  = "Trend Filter"
+grpRetest = "Retest Entry"
+grpExit   = "Risk / Reward"
+grpSess   = "Session"
+grpDisp   = "Display"
+
+atrLen = input.int(14, "ATR Length (used for all distance/buffer filters)", group=grpBreak)
+
+useRthLevels = input.bool(false, "Compute prior day high/low from regular session only", group=grpLevels,
+     tooltip="Leave off for 24/7 markets (crypto) or futures where the full day's range should count.")
+rthSession   = input.session("0930-1600", "Regular session (if restricting above)", group=grpLevels)
+
+allowLongs  = input.bool(true, "Allow longs (break above PDH + retest)", group=grpBreak)
+allowShorts = input.bool(true, "Allow shorts (break below PDL + retest)", group=grpBreak)
+minBreakoutAtrMult = input.float(0.3, "Min breakout distance beyond level (x ATR)", step=0.05, minval=0,
+     group=grpBreak, tooltip="How far the breakout bar's close must clear the level to count as a clean break, not a marginal poke through it. Raised from an original 0.1x default, which barely cleared ordinary 1-min noise and let low-conviction breakouts arm.")
+
+useVwapFilter = input.bool(true, "Only arm breakouts aligned with session VWAP", group=grpTrend,
+     tooltip="Longs only arm when close is above session VWAP; shorts only when below. Filters out PDH/PDL crosses that are really counter-trend exhaustion moves rather than genuine continuation.")
+
+retestToleranceAtrMult = input.float(0.15, "Retest tolerance (x ATR)", step=0.05, minval=0, group=grpRetest,
+     tooltip="How close the pullback must come to the level to count as tagging it.")
+maxWaitBars = input.int(40, "Max bars to wait for retest after breakout", minval=1, group=grpRetest)
+
+riskPercentPerTrade = input.float(1.0, "Risk per trade (% of equity)", step=0.25, minval=0.05, group=grpExit)
+stopBufferAtrMult   = input.float(0.15, "Stop buffer beyond retest high/low (x ATR)", step=0.05, minval=0, group=grpExit)
+
+usePartialAndTrail = input.bool(true, "Scale out at first target, trail the rest", group=grpExit,
+     tooltip="OFF falls back to a single fixed R-multiple target for the whole position (the original v1 behavior). ON books partial profit early and trails an ATR stop on the remainder so a real trend day isn't capped.")
+partialAtRMultiple = input.float(1.0, "Take partial profit at this R multiple", step=0.25, minval=0.25, group=grpExit)
+partialPct = input.float(50, "Percent of position closed at partial target", step=5, minval=5, maxval=95, group=grpExit)
+moveStopToBreakevenOnPartial = input.bool(true, "Move runner's stop to breakeven once partial fills", group=grpExit)
+trailAtrMult = input.float(2.5, "Trail runner by N x ATR off the extreme since entry", step=0.25, minval=0.5, group=grpExit)
+hardCapRMultiple = input.float(5.0, "Hard-cap safety target for the runner (R multiple)", step=0.5, minval=1, group=grpExit,
+     tooltip="Distant backstop limit in case of a gap the trailing stop can't react to intrabar. Not meant to be hit in the normal case — the trailing stop should exit first on a real trend.")
+rewardMultiple = input.float(2.0, "Legacy fixed Reward:Risk multiple (R)", step=0.5, minval=0.5, group=grpExit,
+     tooltip="Only used when 'Scale out at first target, trail the rest' is OFF.")
+
+useSession   = input.bool(true, "Restrict breakouts/entries to session window", group=grpSess,
+     tooltip="ORB edges come from the volume/liquidity right after the open - defaults to the first 90 minutes of US market hours (09:30-11:00). Turn off only if you specifically want to trade breakouts at any time of day.")
+sessionInput = input.session("0930-1100", "Session (exchange time, e.g. first 90 min after open)", group=grpSess)
+
+showLevels        = input.bool(true, "Plot prior day high/low", group=grpDisp)
+showSetupMarkers  = input.bool(true, "Show breakout/retest markers", group=grpDisp)
+showTradeLevels   = input.bool(true, "Show entry/stop/target lines for open trade", group=grpDisp)
+showDashboard     = input.bool(true, "Show status table", group=grpDisp)
+
+// ───────────────────────────── Core calcs ─────────────────────────────
+
+atrVal  = ta.atr(atrLen)
+vwapVal = ta.vwap(hlc3)
+
+inSession = not useSession or not na(time(timeframe.period, sessionInput))
+inRth     = not useRthLevels or not na(time(timeframe.period, rthSession))
+
+passesTrendLong  = not useVwapFilter or close > vwapVal
+passesTrendShort = not useVwapFilter or close < vwapVal
+
+// state: 0 = idle (watching for a breakout), 1 = armed long (waiting for PDH retest),
+// 2 = armed short (waiting for PDL retest)
+var int   state         = 0
+var int   barsInState   = 0
+var float breakoutLevel = na
+
+var float entryPriceVar     = na
+var float stopVar           = na
+var float targetVar         = na
+var float partialTargetVar  = na
+var float hardCapTargetVar  = na
+var float entryQtyVar       = na
+
+// Runner trail state, kept separate per direction so one side's flat-state
+// reset (its own "else" branch) can never clobber the other side's live value
+// on the same bar.
+var float extremeSinceEntry  = na
+var float lowestSinceEntry   = na
+var float runnerStopLongVar  = na
+var float runnerStopShortVar = na
+
+// ───────────────────────────── Prior day high / low ─────────────────────────────
+
+var float pdh     = na
+var float pdl     = na
+var float dayHigh = na
+var float dayLow  = na
+
+isNewDay = ta.change(time("D")) != 0
+
+if isNewDay
+    pdh := dayHigh
+    pdl := dayLow
+    dayHigh := high
+    dayLow  := low
+    // Yesterday's level is gone the moment a new day starts - any setup
+    // still armed against it is stale and needs a fresh breakout of today's level.
+    state := 0
+    barsInState := 0
+else
+    if inRth
+        dayHigh := na(dayHigh) ? high : math.max(dayHigh, high)
+        dayLow  := na(dayLow)  ? low  : math.min(dayLow, low)
+
+// ───────────────────────────── Stage 2: clean breakout (arm the setup) ─────────────────────────────
+
+breakoutUpEvent   = false
+breakoutDownEvent = false
+
+if state == 0 and inSession
+    if allowLongs and passesTrendLong and not na(pdh) and ta.crossover(close, pdh) and (close - pdh) >= minBreakoutAtrMult * atrVal
+        state := 1
+        breakoutLevel := pdh
+        barsInState := 0
+        breakoutUpEvent := true
+    else if allowShorts and passesTrendShort and not na(pdl) and ta.crossunder(close, pdl) and (pdl - close) >= minBreakoutAtrMult * atrVal
+        state := 2
+        breakoutLevel := pdl
+        barsInState := 0
+        breakoutDownEvent := true
+
+// ───────────────────────────── Stage 3: wait for the retest ─────────────────────────────
+
+longRetestSignal  = false
+shortRetestSignal = false
+
+if state == 1
+    barsInState += 1
+    if close < breakoutLevel
+        // Gave the whole breakout back before ever retesting - setup failed.
+        state := 0
+        barsInState := 0
+    else if inSession and low <= breakoutLevel + retestToleranceAtrMult * atrVal
+        longRetestSignal := true
+    else if barsInState >= maxWaitBars
+        state := 0
+        barsInState := 0
+
+if state == 2
+    barsInState += 1
+    if close > breakoutLevel
+        state := 0
+        barsInState := 0
+    else if inSession and high >= breakoutLevel - retestToleranceAtrMult * atrVal
+        shortRetestSignal := true
+    else if barsInState >= maxWaitBars
+        state := 0
+        barsInState := 0
+
+// ───────────────────────────── Stage 4: entry, stop, exit orders ─────────────────────────────
+
+longEntryNow  = false
+shortEntryNow = false
+
+if longRetestSignal
+    if strategy.position_size == 0 and inSession
+        stopCandidate = low - stopBufferAtrMult * atrVal
+        riskPerUnit = close - stopCandidate
+        if riskPerUnit > 0
+            qty = (strategy.equity * riskPercentPerTrade / 100) / riskPerUnit
+            strategy.entry("Long", strategy.long, qty=qty)
+            entryPriceVar := close
+            stopVar := stopCandidate
+            entryQtyVar := qty
+            if usePartialAndTrail
+                partialTargetVar := close + partialAtRMultiple * riskPerUnit
+                hardCapTargetVar := close + hardCapRMultiple * riskPerUnit
+                targetVar := hardCapTargetVar
+                strategy.exit("Long Partial", from_entry="Long", qty_percent=partialPct, limit=partialTargetVar, stop=stopVar)
+                strategy.exit("Long Runner",  from_entry="Long", qty_percent=100, stop=stopVar, limit=hardCapTargetVar)
+            else
+                targetVar := close + rewardMultiple * riskPerUnit
+                strategy.exit("Long Exit", from_entry="Long", stop=stopVar, limit=targetVar)
+            longEntryNow := true
+    // One retest attempt per breakout, taken or not - back to idle either way.
+    state := 0
+    barsInState := 0
+
+if shortRetestSignal
+    if strategy.position_size == 0 and inSession
+        stopCandidate = high + stopBufferAtrMult * atrVal
+        riskPerUnit = stopCandidate - close
+        if riskPerUnit > 0
+            qty = (strategy.equity * riskPercentPerTrade / 100) / riskPerUnit
+            strategy.entry("Short", strategy.short, qty=qty)
+            entryPriceVar := close
+            stopVar := stopCandidate
+            entryQtyVar := qty
+            if usePartialAndTrail
+                partialTargetVar := close - partialAtRMultiple * riskPerUnit
+                hardCapTargetVar := close - hardCapRMultiple * riskPerUnit
+                targetVar := hardCapTargetVar
+                strategy.exit("Short Partial", from_entry="Short", qty_percent=partialPct, limit=partialTargetVar, stop=stopVar)
+                strategy.exit("Short Runner",  from_entry="Short", qty_percent=100, stop=stopVar, limit=hardCapTargetVar)
+            else
+                targetVar := close - rewardMultiple * riskPerUnit
+                strategy.exit("Short Exit", from_entry="Short", stop=stopVar, limit=targetVar)
+            shortEntryNow := true
+    state := 0
+    barsInState := 0
+
+// ───────────────────────────── Runner trail management (after partial fills) ─────────────────────────────
+// Re-issues the "Runner" exit order every bar with a ratcheting stop once the
+// partial target has filled: breakeven first (optional), then an ATR
+// chandelier trail off the extreme since entry — mirrors
+// pine/BMNR_TrendSwing_v1.pine's trailing-stop mechanism. Inferred purely
+// from position size shrinking below the original entry qty, since Pine
+// strategies don't expose a direct "was this specific exit order filled" flag.
+
+partialFilledLong  = usePartialAndTrail and strategy.position_size > 0 and not na(entryQtyVar) and strategy.position_size < entryQtyVar - syminfo.mintick
+partialFilledShort = usePartialAndTrail and strategy.position_size < 0 and not na(entryQtyVar) and math.abs(strategy.position_size) < entryQtyVar - syminfo.mintick
+
+if strategy.position_size > 0
+    extremeSinceEntry := na(extremeSinceEntry) ? high : math.max(extremeSinceEntry, high)
+    if partialFilledLong
+        chandStop = extremeSinceEntry - trailAtrMult * atrVal
+        floorStop = moveStopToBreakevenOnPartial ? math.max(chandStop, entryPriceVar) : chandStop
+        runnerStopLongVar := na(runnerStopLongVar) ? math.max(floorStop, stopVar) : math.max(runnerStopLongVar, floorStop)
+        strategy.exit("Long Runner", from_entry="Long", qty_percent=100, stop=runnerStopLongVar, limit=hardCapTargetVar)
+    else
+        runnerStopLongVar := stopVar
+else
+    extremeSinceEntry := na
+    runnerStopLongVar := na
+
+if strategy.position_size < 0
+    lowestSinceEntry := na(lowestSinceEntry) ? low : math.min(lowestSinceEntry, low)
+    if partialFilledShort
+        chandStopS = lowestSinceEntry + trailAtrMult * atrVal
+        floorStopS = moveStopToBreakevenOnPartial ? math.min(chandStopS, entryPriceVar) : chandStopS
+        runnerStopShortVar := na(runnerStopShortVar) ? math.min(floorStopS, stopVar) : math.min(runnerStopShortVar, floorStopS)
+        strategy.exit("Short Runner", from_entry="Short", qty_percent=100, stop=runnerStopShortVar, limit=hardCapTargetVar)
+    else
+        runnerStopShortVar := stopVar
+else
+    lowestSinceEntry := na
+    runnerStopShortVar := na
+
+// ───────────────────────────── Plots ─────────────────────────────
+
+plot(showLevels ? pdh : na, "Prior Day High", color=color.new(color.blue, 0), style=plot.style_linebr, linewidth=1)
+plot(showLevels ? pdl : na, "Prior Day Low",  color=color.new(color.orange, 0), style=plot.style_linebr, linewidth=1)
+plot(showLevels ? vwapVal : na, "Session VWAP", color=color.new(color.purple, 40), style=plot.style_line, linewidth=1)
+
+plotshape(showSetupMarkers and breakoutUpEvent, title="Breakout Up", style=shape.triangleup,
+     location=location.belowbar, color=color.new(color.blue, 0), size=size.tiny, text="BO")
+plotshape(showSetupMarkers and breakoutDownEvent, title="Breakout Down", style=shape.triangledown,
+     location=location.abovebar, color=color.new(color.blue, 0), size=size.tiny, text="BO")
+
+plotshape(showSetupMarkers and longEntryNow, title="Long Entry (Retest)", style=shape.triangleup,
+     location=location.belowbar, color=color.new(color.lime, 0), size=size.small, text="LONG")
+plotshape(showSetupMarkers and shortEntryNow, title="Short Entry (Retest)", style=shape.triangledown,
+     location=location.abovebar, color=color.new(color.red, 0), size=size.small, text="SHORT")
+
+bgcolor(state == 1 ? color.new(color.lime, 90) : state == 2 ? color.new(color.red, 90) : na,
+     title="Armed Setup Highlight")
+
+activeStopLong  = strategy.position_size > 0 ? (partialFilledLong ? runnerStopLongVar : stopVar) : na
+activeStopShort = strategy.position_size < 0 ? (partialFilledShort ? runnerStopShortVar : stopVar) : na
+
+tradeEntryPlot   = strategy.position_size != 0 ? entryPriceVar : na
+tradeStopPlot    = strategy.position_size > 0 ? activeStopLong : strategy.position_size < 0 ? activeStopShort : na
+tradeTargetPlot  = strategy.position_size != 0 ? targetVar : na
+tradePartialPlot = usePartialAndTrail and strategy.position_size != 0 ? partialTargetVar : na
+
+plot(showTradeLevels ? tradeEntryPlot : na, "Entry Price",
+     color=color.new(color.gray, 20), style=plot.style_linebr, linewidth=1)
+plot(showTradeLevels ? tradeStopPlot : na, "Stop Loss",
+     color=color.new(color.red, 0), style=plot.style_linebr, linewidth=2)
+plot(showTradeLevels ? tradePartialPlot : na, "Partial Target",
+     color=color.new(color.teal, 30), style=plot.style_linebr, linewidth=1)
+plot(showTradeLevels ? tradeTargetPlot : na, "Take Profit / Hard Cap",
+     color=color.new(color.green, 0), style=plot.style_linebr, linewidth=2)
+
+if showTradeLevels and longEntryNow
+    label.new(bar_index, stopVar, "SL " + str.tostring(stopVar, format.mintick),
+         style=label.style_label_up, color=color.new(color.red, 15), textcolor=color.white, size=size.tiny)
+    label.new(bar_index, targetVar, "TP " + str.tostring(targetVar, format.mintick),
+         style=label.style_label_down, color=color.new(color.green, 15), textcolor=color.white, size=size.tiny)
+if showTradeLevels and shortEntryNow
+    label.new(bar_index, stopVar, "SL " + str.tostring(stopVar, format.mintick),
+         style=label.style_label_down, color=color.new(color.red, 15), textcolor=color.white, size=size.tiny)
+    label.new(bar_index, targetVar, "TP " + str.tostring(targetVar, format.mintick),
+         style=label.style_label_up, color=color.new(color.green, 15), textcolor=color.white, size=size.tiny)
+
+// ───────────────────────────── Dashboard ─────────────────────────────
+
+var table dash = table.new(position.top_right, 2, 8, border_width=1)
+
+if showDashboard and barstate.islast
+    stateLabel = state == 1 ? "Armed: waiting long retest" : state == 2 ? "Armed: waiting short retest" : "Idle: watching for breakout"
+    stateColor = state == 1 ? color.new(color.green, 60) : state == 2 ? color.new(color.red, 60) : color.new(color.gray, 70)
+
+    table.cell(dash, 0, 0, "Setup State", bgcolor=color.gray, text_color=color.white)
+    table.cell(dash, 1, 0, stateLabel, bgcolor=stateColor)
+
+    table.cell(dash, 0, 1, "Prior Day High", bgcolor=color.gray, text_color=color.white)
+    table.cell(dash, 1, 1, na(pdh) ? "n/a" : str.tostring(pdh, format.mintick))
+
+    table.cell(dash, 0, 2, "Prior Day Low", bgcolor=color.gray, text_color=color.white)
+    table.cell(dash, 1, 2, na(pdl) ? "n/a" : str.tostring(pdl, format.mintick))
+
+    table.cell(dash, 0, 3, "ATR", bgcolor=color.gray, text_color=color.white)
+    table.cell(dash, 1, 3, str.tostring(atrVal, format.mintick))
+
+    table.cell(dash, 0, 4, "Bars Waiting", bgcolor=color.gray, text_color=color.white)
+    table.cell(dash, 1, 4, state == 0 ? "-" : str.tostring(barsInState) + " / " + str.tostring(maxWaitBars))
+
+    table.cell(dash, 0, 5, "In Session", bgcolor=color.gray, text_color=color.white)
+    table.cell(dash, 1, 5, inSession ? "Yes" : "No",
+         bgcolor=inSession ? color.new(color.green, 60) : color.new(color.red, 60))
+
+    table.cell(dash, 0, 6, "Partial Taken", bgcolor=color.gray, text_color=color.white)
+    partialLabel = strategy.position_size == 0 ? "-" : (partialFilledLong or partialFilledShort) ? "Yes" : "No"
+    table.cell(dash, 1, 6, partialLabel)
+
+    table.cell(dash, 0, 7, "Runner Stop", bgcolor=color.gray, text_color=color.white)
+    runnerTxt = strategy.position_size > 0 ? str.tostring(activeStopLong, format.mintick) : strategy.position_size < 0 ? str.tostring(activeStopShort, format.mintick) : "-"
+    table.cell(dash, 1, 7, runnerTxt)
+
+// ───────────────────────────── Alerts ─────────────────────────────
+
+alertcondition(longEntryNow, title="ORB Long Entry", message="{{ticker}} ORB retest long entry at {{close}}")
+alertcondition(shortEntryNow, title="ORB Short Entry", message="{{ticker}} ORB retest short entry at {{close}}")
+
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
