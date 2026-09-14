@@ -152,14 +152,11 @@ else
 
 // ───────────────────────────── Position sizing ─────────────────────────────
 
-initialStopDistLong  = atrVal * chandelierMult
-initialStopDistShort = atrVal * chandelierMult
+initialStopDist = atrVal * chandelierMult
+riskBasedQty = (strategy.equity * riskPct / 100) / math.max(initialStopDist, syminfo.mintick)
 
-riskBasedQtyLong  = (strategy.equity * riskPct / 100) / math.max(initialStopDistLong, syminfo.mintick)
-riskBasedQtyShort = (strategy.equity * riskPct / 100) / math.max(initialStopDistShort, syminfo.mintick)
-
-qtyLong  = sizingMode == "Risk % of equity" ? riskBasedQtyLong  : fixedCashUsd / close
-qtyShort = sizingMode == "Risk % of equity" ? riskBasedQtyShort : fixedCashUsd / close
+qtyLong  = sizingMode == "Risk % of equity" ? riskBasedQty : fixedCashUsd / close
+qtyShort = sizingMode == "Risk % of equity" ? riskBasedQty : fixedCashUsd / close
 
 // ───────────────────────────── Entries / exits ─────────────────────────────
 
