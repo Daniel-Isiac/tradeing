@@ -164,11 +164,12 @@ signals before considering live mode.
   added for bot integration.
 - `pine/BMNR_TrendSwing_v1.pine` — a swing trend-following strategy for BMNR
   specifically (Donchian breakout + ATR chandelier trailing stop); see above.
-- `pine/ORB_3.pine` — a break-of-prior-day-high/low + retest intraday
-  strategy (third iteration, versioned in-file: v1 fixed-R exit, v2 added
+- `pine/ORB_4.pine` — a break-of-prior-day-high/low + retest intraday
+  strategy (fourth iteration, versioned in-file: v1 fixed-R exit, v2 added
   scale-out/trail plus breakout/VWAP filters, v3 fixed an ATR-lag bug in the
-  trailing stop). Not wired into `bot/` — TradingView-side only, like
-  `BMNR_TrendSwing_v1.pine`.
+  trailing stop, v4 added an opening-range gate so entries can't arm during
+  the first few chaotic minutes of the session). Not wired into `bot/` —
+  TradingView-side only, like `BMNR_TrendSwing_v1.pine`.
 - `bot/config.py` — all settings, loaded from `.env`.
 - `bot/kraken_client.py` — thin ccxt wrapper (public price data + private orders).
 - `bot/broker.py` — `PaperBroker` (simulated fills) / `LiveBroker` (real orders).

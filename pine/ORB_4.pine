@@ -1,8 +1,9 @@
-// ORB 3 — break of prior day high/low, then enter on the retest.
-// (Third iteration of this ORB strategy — v1 was the original break+retest+
-// fixed-R design, v2 added scale-out/trail + trend/breakout filters, v3 below
-// fixed an ATR-lag bug in the trail. Kept as one versioned file rather than
-// three separate scripts so the fix history stays attached to the code.)
+// ORB 4 — break of prior day high/low, then enter on the retest.
+// (Fourth iteration of this ORB strategy — v1 was the original break+retest+
+// fixed-R design, v2 added scale-out/trail + trend/breakout filters, v3 fixed
+// an ATR-lag bug in the trail, v4 below adds an opening-range gate. Kept as
+// one versioned file rather than four separate scripts so the fix history
+// stays attached to the code.)
 //
 // Logic (4 stages, re-armed independently every time the state resets to idle):
 //   1. TRACK LEVELS — the prior completed day's high (PDH) and low (PDL) are
@@ -88,6 +89,27 @@
 //   still governs the breakout filter, retest tolerance, and initial stop
 //   buffer — only the runner's trail changed.
 //
+// v4 FIX (from a backtested HOOD short on Sep 9: the short armed and entered
+// within the first couple bars of the session, right into the erratic
+// swing every open tends to have before real direction sets in, and got
+// stopped for -78):
+//   NO PROTECTION AGAINST THE CHAOTIC OPEN — nothing stopped a PDH/PDL
+//   breakout from arming and retesting in the first bar or two of the
+//   session, when price is often just noise settling out rather than a real
+//   directional move.
+//   FIX: an opening-range gate. The first `orMinutes` (default 5) minutes of
+//   the session are tracked as a high/low (the classic "opening range," ORB).
+//   Once that window closes, a PDH-retest LONG can only arm after price has
+//   already closed above the opening-range high, and a PDL-retest SHORT only
+//   after price has closed below the opening-range low — each a one-time,
+//   sticky flag for the day (set to true, stays true), not something that
+//   flips back and forth. This both skips the first few chaotic minutes
+//   entirely (no breakout can arm during the opening-range window itself)
+//   and requires the day to have already shown real directional conviction
+//   in that direction before the PDH/PDL break+retest logic is allowed to
+//   look for a trade — same entry mechanism as before, just gated behind a
+//   confirmation step. Toggle `useOrFilter` off to go back to v3 behavior.
+//
 // SCALE-OUT + TRAIL EXIT (new default exit model): at entry, a limit order
 // closes `partialPct`% of the position at `partialAtRMultiple` x the initial
 // risk (banks profit early). Once that partial fills, the stop for the
@@ -103,8 +125,8 @@
 // of future results. Research/comparison tool only.
 
 //@version=6
-strategy("ORB 3 (Break of Prior Day High/Low + Retest Entry, Scale-Out/Trail)",
-     shorttitle="ORB 3", overlay=true, initial_capital=10000, currency=currency.USD,
+strategy("ORB 4 (Break of Prior Day High/Low + Retest Entry, Scale-Out/Trail)",
+     shorttitle="ORB 4", overlay=true, initial_capital=10000, currency=currency.USD,
      commission_type=strategy.commission.percent, commission_value=0.05, slippage=1,
      pyramiding=0, calc_on_every_tick=false, process_orders_on_close=true)
 
@@ -113,6 +135,7 @@ strategy("ORB 3 (Break of Prior Day High/Low + Retest Entry, Scale-Out/Trail)",
 grpLevels = "Prior Day Levels"
 grpBreak  = "Breakout Filter"
 grpTrend  = "Trend Filter"
+grpOR     = "Opening Range Filter"
 grpRetest = "Retest Entry"
 grpExit   = "Risk / Reward"
 grpSess   = "Session"
@@ -131,6 +154,11 @@ minBreakoutAtrMult = input.float(0.3, "Min breakout distance beyond level (x ATR
 
 useVwapFilter = input.bool(true, "Only arm breakouts aligned with session VWAP", group=grpTrend,
      tooltip="Longs only arm when close is above session VWAP; shorts only when below. Filters out PDH/PDL crosses that are really counter-trend exhaustion moves rather than genuine continuation.")
+
+useOrFilter = input.bool(true, "Require an opening-range breakout before allowing PDH/PDL entries", group=grpOR,
+     tooltip="Skips the chaotic first few minutes of the session entirely, then only allows a PDH-retest long after price has closed above the opening-range high (or a PDL-retest short after closing below the opening-range low). Sticky for the day once true.")
+orMinutes = input.int(5, "Opening range length (minutes)", minval=1, group=grpOR,
+     tooltip="How many minutes of the session, starting at the session window's own start time, form the opening range high/low. Classic ORB default is 5.")
 
 retestToleranceAtrMult = input.float(0.15, "Retest tolerance (x ATR)", step=0.05, minval=0, group=grpRetest,
      tooltip="How close the pullback must come to the level to count as tagging it.")
@@ -157,6 +185,7 @@ useSession   = input.bool(true, "Restrict breakouts/entries to session window", 
 sessionInput = input.session("0930-1100", "Session (exchange time, e.g. first 90 min after open)", group=grpSess)
 
 showLevels        = input.bool(true, "Plot prior day high/low", group=grpDisp)
+showOrLevels      = input.bool(true, "Plot opening range high/low", group=grpDisp)
 showSetupMarkers  = input.bool(true, "Show breakout/retest markers", group=grpDisp)
 showTradeLevels   = input.bool(true, "Show entry/stop/target lines for open trade", group=grpDisp)
 showDashboard     = input.bool(true, "Show status table", group=grpDisp)
@@ -200,6 +229,17 @@ var float runnerStopShortVar = na
 var float highestTrailAtrLong  = na
 var float highestTrailAtrShort = na
 
+// Opening range state — the first `orMinutes` of the session's high/low, and
+// whether the day has since shown a confirmed breakout of it in either
+// direction. orBrokeUp/orBrokeDown are sticky for the day (set once, stay
+// true) rather than re-evaluated every bar.
+var int   sessionStartTime = na
+var float orHigh           = na
+var float orLow            = na
+var bool  orComplete       = false
+var bool  orBrokeUp        = false
+var bool  orBrokeDown      = false
+
 // ───────────────────────────── Prior day high / low ─────────────────────────────
 
 var float pdh     = na
@@ -218,10 +258,43 @@ if isNewDay
     // still armed against it is stale and needs a fresh breakout of today's level.
     state := 0
     barsInState := 0
+    sessionStartTime := na
+    orHigh := na
+    orLow := na
+    orComplete := false
+    orBrokeUp := false
+    orBrokeDown := false
 else
     if inRth
         dayHigh := na(dayHigh) ? high : math.max(dayHigh, high)
         dayLow  := na(dayLow)  ? low  : math.min(dayLow, low)
+
+// ───────────────────────────── Opening range tracking ─────────────────────────────
+// Anchored to the entry session window's own start time (sessionInput, or the
+// calendar day if useSession is off) rather than a fixed clock time, so this
+// still works correctly regardless of chart timeframe or market hours. The
+// window itself only accumulates orHigh/orLow — breakout checks happen only
+// once it's closed (orComplete), so the range's own formation bars can't
+// "break" a range that's still being built.
+
+if inSession and na(sessionStartTime)
+    sessionStartTime := time
+
+inOpeningRange = inSession and not na(sessionStartTime) and (time - sessionStartTime) < orMinutes * 60 * 1000
+
+if inOpeningRange
+    orHigh := na(orHigh) ? high : math.max(orHigh, high)
+    orLow  := na(orLow)  ? low  : math.min(orLow, low)
+else if inSession and not orComplete and not na(orHigh)
+    orComplete := true
+
+if orComplete and not orBrokeUp and not na(orHigh) and close > orHigh
+    orBrokeUp := true
+if orComplete and not orBrokeDown and not na(orLow) and close < orLow
+    orBrokeDown := true
+
+passesOrLong  = not useOrFilter or orBrokeUp
+passesOrShort = not useOrFilter or orBrokeDown
 
 // ───────────────────────────── Stage 2: clean breakout (arm the setup) ─────────────────────────────
 
@@ -229,12 +302,12 @@ breakoutUpEvent   = false
 breakoutDownEvent = false
 
 if state == 0 and inSession
-    if allowLongs and passesTrendLong and not na(pdh) and ta.crossover(close, pdh) and (close - pdh) >= minBreakoutAtrMult * atrVal
+    if allowLongs and passesTrendLong and passesOrLong and not na(pdh) and ta.crossover(close, pdh) and (close - pdh) >= minBreakoutAtrMult * atrVal
         state := 1
         breakoutLevel := pdh
         barsInState := 0
         breakoutUpEvent := true
-    else if allowShorts and passesTrendShort and not na(pdl) and ta.crossunder(close, pdl) and (pdl - close) >= minBreakoutAtrMult * atrVal
+    else if allowShorts and passesTrendShort and passesOrShort and not na(pdl) and ta.crossunder(close, pdl) and (pdl - close) >= minBreakoutAtrMult * atrVal
         state := 2
         breakoutLevel := pdl
         barsInState := 0
@@ -366,6 +439,8 @@ else
 plot(showLevels ? pdh : na, "Prior Day High", color=color.new(color.blue, 0), style=plot.style_linebr, linewidth=1)
 plot(showLevels ? pdl : na, "Prior Day Low",  color=color.new(color.orange, 0), style=plot.style_linebr, linewidth=1)
 plot(showLevels ? vwapVal : na, "Session VWAP", color=color.new(color.purple, 40), style=plot.style_line, linewidth=1)
+plot(showOrLevels ? orHigh : na, "Opening Range High", color=color.new(color.aqua, 20), style=plot.style_circles, linewidth=1)
+plot(showOrLevels ? orLow  : na, "Opening Range Low",  color=color.new(color.aqua, 20), style=plot.style_circles, linewidth=1)
 
 plotshape(showSetupMarkers and breakoutUpEvent, title="Breakout Up", style=shape.triangleup,
      location=location.belowbar, color=color.new(color.blue, 0), size=size.tiny, text="BO")
@@ -410,7 +485,7 @@ if showTradeLevels and shortEntryNow
 
 // ───────────────────────────── Dashboard ─────────────────────────────
 
-var table dash = table.new(position.top_right, 2, 8, border_width=1)
+var table dash = table.new(position.top_right, 2, 9, border_width=1)
 
 if showDashboard and barstate.islast
     stateLabel = state == 1 ? "Armed: waiting long retest" : state == 2 ? "Armed: waiting short retest" : "Idle: watching for breakout"
@@ -442,6 +517,11 @@ if showDashboard and barstate.islast
     table.cell(dash, 0, 7, "Runner Stop", bgcolor=color.gray, text_color=color.white)
     runnerTxt = strategy.position_size > 0 ? str.tostring(activeStopLong, format.mintick) : strategy.position_size < 0 ? str.tostring(activeStopShort, format.mintick) : "-"
     table.cell(dash, 1, 7, runnerTxt)
+
+    table.cell(dash, 0, 8, "Opening Range", bgcolor=color.gray, text_color=color.white)
+    orLabel = not orComplete ? "Forming..." : orBrokeUp and orBrokeDown ? "Broke both" : orBrokeUp ? "Broke up" : orBrokeDown ? "Broke down" : "No break yet"
+    orColor = orBrokeUp ? color.new(color.green, 60) : orBrokeDown ? color.new(color.red, 60) : color.new(color.gray, 70)
+    table.cell(dash, 1, 8, orLabel, bgcolor=orColor)
 
 // ───────────────────────────── Alerts ─────────────────────────────
 
