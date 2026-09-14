@@ -1,4 +1,8 @@
-// ORB Retest Strategy — break of prior day high/low, then enter on the retest.
+// ORB 3 — break of prior day high/low, then enter on the retest.
+// (Third iteration of this ORB strategy — v1 was the original break+retest+
+// fixed-R design, v2 added scale-out/trail + trend/breakout filters, v3 below
+// fixed an ATR-lag bug in the trail. Kept as one versioned file rather than
+// three separate scripts so the fix history stays attached to the code.)
 //
 // Logic (4 stages, re-armed independently every time the state resets to idle):
 //   1. TRACK LEVELS — the prior completed day's high (PDH) and low (PDL) are
@@ -99,8 +103,8 @@
 // of future results. Research/comparison tool only.
 
 //@version=6
-strategy("ORB Retest Strategy v2 (Break of Prior Day High/Low + Retest Entry, Scale-Out/Trail)",
-     shorttitle="ORB Retest v2", overlay=true, initial_capital=10000, currency=currency.USD,
+strategy("ORB 3 (Break of Prior Day High/Low + Retest Entry, Scale-Out/Trail)",
+     shorttitle="ORB 3", overlay=true, initial_capital=10000, currency=currency.USD,
      commission_type=strategy.commission.percent, commission_value=0.05, slippage=1,
      pyramiding=0, calc_on_every_tick=false, process_orders_on_close=true)
 
