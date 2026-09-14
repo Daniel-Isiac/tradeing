@@ -63,6 +63,27 @@
 //      (matches how the other two strategies in this repo already work) so
 //      the fill lines up with the bar the stop/target math was based on.
 //
+// v3 FIX (from a backtested MSTR short on Sep 8: entered ~$138, then a single
+// ~$9 1-min crash bar in its favor — the exact move a trend-following exit
+// should cash in on — but the runner only banked +$31 on top of the +$30
+// partial, giving back almost the whole move):
+//   ATR-LAG TRAP RIGHT AFTER A SHOCK — the chandelier trail used the same
+//   ATR(atrLen=14) as everything else. ta.atr is a Wilder RMA: a single new
+//   bar only shifts it by ~1/atrLen of the difference, so right after a huge
+//   crash bar the "current" ATR still barely reflects what just happened
+//   (roughly 0.26 -> 0.88 off a $9 bar, in this trade). trailAtrMult x that
+//   lagging ATR produced a trail only ~$2.2 wide immediately after a $9 move
+//   — any ordinary post-crash bounce tagged it right away. Worse, the stop
+//   only ever ratchets tighter, so that lag-distorted tight level stuck for
+//   the rest of the trade even once the 14-bar ATR eventually caught up.
+//   FIX: the chandelier trail now uses its own separate, shorter
+//   `trailAtrLen` (default 5) so it reacts to a volatility shock within a
+//   few bars instead of ~14, AND tracks the highest trail-ATR reading seen
+//   since entry so the trail distance can only widen after a shock, never
+//   quietly shrink back down on the next calm bar. The original `atrLen`
+//   still governs the breakout filter, retest tolerance, and initial stop
+//   buffer — only the runner's trail changed.
+//
 // SCALE-OUT + TRAIL EXIT (new default exit model): at entry, a limit order
 // closes `partialPct`% of the position at `partialAtRMultiple` x the initial
 // risk (banks profit early). Once that partial fills, the stop for the
@@ -120,6 +141,8 @@ partialAtRMultiple = input.float(1.0, "Take partial profit at this R multiple", 
 partialPct = input.float(50, "Percent of position closed at partial target", step=5, minval=5, maxval=95, group=grpExit)
 moveStopToBreakevenOnPartial = input.bool(true, "Move runner's stop to breakeven once partial fills", group=grpExit)
 trailAtrMult = input.float(2.5, "Trail runner by N x ATR off the extreme since entry", step=0.25, minval=0.5, group=grpExit)
+trailAtrLen = input.int(5, "Trail ATR length (separate, faster than the main ATR length)", minval=1, group=grpExit,
+     tooltip="Deliberately shorter than the main ATR Length above so the trail widens within a few bars of a volatility shock instead of needing ~14 bars to catch up (an ordinary-length ATR badly lags a sudden big bar, making a post-shock trail too tight right when it should be widest).")
 hardCapRMultiple = input.float(5.0, "Hard-cap safety target for the runner (R multiple)", step=0.5, minval=1, group=grpExit,
      tooltip="Distant backstop limit in case of a gap the trailing stop can't react to intrabar. Not meant to be hit in the normal case — the trailing stop should exit first on a real trend.")
 rewardMultiple = input.float(2.0, "Legacy fixed Reward:Risk multiple (R)", step=0.5, minval=0.5, group=grpExit,
@@ -136,8 +159,9 @@ showDashboard     = input.bool(true, "Show status table", group=grpDisp)
 
 // ───────────────────────────── Core calcs ─────────────────────────────
 
-atrVal  = ta.atr(atrLen)
-vwapVal = ta.vwap(hlc3)
+atrVal      = ta.atr(atrLen)
+trailAtrVal = ta.atr(trailAtrLen)
+vwapVal     = ta.vwap(hlc3)
 
 inSession = not useSession or not na(time(timeframe.period, sessionInput))
 inRth     = not useRthLevels or not na(time(timeframe.period, rthSession))
@@ -165,6 +189,12 @@ var float extremeSinceEntry  = na
 var float lowestSinceEntry   = na
 var float runnerStopLongVar  = na
 var float runnerStopShortVar = na
+
+// Highest trail-ATR reading seen since entry, per direction. Feeds the
+// chandelier trail instead of the live trailAtrVal so a volatility shock can
+// only widen the trail, never quietly shrink it back on the next calm bar.
+var float highestTrailAtrLong  = na
+var float highestTrailAtrShort = na
 
 // ───────────────────────────── Prior day high / low ─────────────────────────────
 
@@ -299,8 +329,9 @@ partialFilledShort = usePartialAndTrail and strategy.position_size < 0 and not n
 
 if strategy.position_size > 0
     extremeSinceEntry := na(extremeSinceEntry) ? high : math.max(extremeSinceEntry, high)
+    highestTrailAtrLong := na(highestTrailAtrLong) ? trailAtrVal : math.max(highestTrailAtrLong, trailAtrVal)
     if partialFilledLong
-        chandStop = extremeSinceEntry - trailAtrMult * atrVal
+        chandStop = extremeSinceEntry - trailAtrMult * highestTrailAtrLong
         floorStop = moveStopToBreakevenOnPartial ? math.max(chandStop, entryPriceVar) : chandStop
         runnerStopLongVar := na(runnerStopLongVar) ? math.max(floorStop, stopVar) : math.max(runnerStopLongVar, floorStop)
         strategy.exit("Long Runner", from_entry="Long", qty_percent=100, stop=runnerStopLongVar, limit=hardCapTargetVar)
@@ -308,12 +339,14 @@ if strategy.position_size > 0
         runnerStopLongVar := stopVar
 else
     extremeSinceEntry := na
+    highestTrailAtrLong := na
     runnerStopLongVar := na
 
 if strategy.position_size < 0
     lowestSinceEntry := na(lowestSinceEntry) ? low : math.min(lowestSinceEntry, low)
+    highestTrailAtrShort := na(highestTrailAtrShort) ? trailAtrVal : math.max(highestTrailAtrShort, trailAtrVal)
     if partialFilledShort
-        chandStopS = lowestSinceEntry + trailAtrMult * atrVal
+        chandStopS = lowestSinceEntry + trailAtrMult * highestTrailAtrShort
         floorStopS = moveStopToBreakevenOnPartial ? math.min(chandStopS, entryPriceVar) : chandStopS
         runnerStopShortVar := na(runnerStopShortVar) ? math.min(floorStopS, stopVar) : math.min(runnerStopShortVar, floorStopS)
         strategy.exit("Short Runner", from_entry="Short", qty_percent=100, stop=runnerStopShortVar, limit=hardCapTargetVar)
@@ -321,6 +354,7 @@ if strategy.position_size < 0
         runnerStopShortVar := stopVar
 else
     lowestSinceEntry := na
+    highestTrailAtrShort := na
     runnerStopShortVar := na
 
 // ───────────────────────────── Plots ─────────────────────────────
