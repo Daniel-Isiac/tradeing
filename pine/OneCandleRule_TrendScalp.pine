@@ -1,0 +1,299 @@
+// One Candle Rule Trend Scalper
+//
+// Three-step mechanical intraday strategy:
+//
+//   1. Trend filter: on the daily timeframe, classify the trend from swing
+//      structure - higher highs + higher lows = uptrend, lower highs +
+//      lower lows = downtrend, anything else = sideways/choppy (skipped by
+//      default, since chop is where this kind of pullback entry gets faked
+//      out).
+//   2. Entry model ("one candle rule"): on the 1-minute chart, during the
+//      first N minutes after the open, track a single reference candle -
+//      in an uptrend, the most recent down-close (red) candle that formed
+//      at a new intraday high (support, since buyers defended it); in a
+//      downtrend, the most recent up-close (green) candle that formed at a
+//      new intraday low (resistance, since sellers defended it). As price
+//      keeps trending, that reference candle keeps getting replaced by a
+//      newer, better one - a trailing level, not a fixed one. Entry
+//      triggers when price retests into that candle's zone and closes back
+//      in the trend direction (support/resistance holding).
+//   3. Risk: stop-loss at the reference candle's body (or its full wick,
+//      configurable), target at least a fixed reward multiple of the
+//      initial risk. The stop trails up/down with the reference candle
+//      while the trade is open, locking in progress as the trend continues.
+//
+// Position sizing is risk-based (a fixed % of equity divided by the trade's
+// actual stop distance) rather than a flat share/contract count.
+//
+// Works on any instrument/timeframe combination (stocks, futures, forex,
+// crypto) as long as the chart is run at or below one minute for the
+// retest/entry logic to have the resolution it needs.
+//
+// NON-REPAINTING on the entry timeframe: calc_on_every_tick is disabled -
+// every signal locks in at bar close. The daily trend filter necessarily
+// lags by the pivot's right-side confirmation bars, which is expected for
+// any swing-structure classification.
+//
+// Past performance in the Strategy Tester is hypothetical and not
+// indicative of future results. Research/education tool only, not
+// financial advice.
+
+//@version=6
+
+f_dailyBias(leftBars, rightBars) =>
+    var float lastPH = na
+    var float prevPH = na
+    var float lastPL = na
+    var float prevPL = na
+    var string state = "sideways"
+    ph = ta.pivothigh(high, leftBars, rightBars)
+    pl = ta.pivotlow(low, leftBars, rightBars)
+    if not na(ph)
+        prevPH := lastPH
+        lastPH := ph
+    if not na(pl)
+        prevPL := lastPL
+        lastPL := pl
+    if not na(lastPH) and not na(prevPH) and not na(lastPL) and not na(prevPL)
+        if lastPH > prevPH and lastPL > prevPL
+            state := "up"
+        else if lastPH < prevPH and lastPL < prevPL
+            state := "down"
+        else
+            state := "sideways"
+    state
+
+strategy("One Candle Rule Trend Scalper", shorttitle="OCR60", overlay=true,
+     calc_on_every_tick=false, process_orders_on_close=true,
+     default_qty_type=strategy.percent_of_equity, default_qty_value=10,
+     initial_capital=25000, commission_type=strategy.commission.cash_per_order,
+     commission_value=0, slippage=1, max_labels_count=500)
+
+// ---- Inputs ----
+
+grpSession = "Session"
+sessionTz = input.string("America/New_York", "Session Timezone", group=grpSession,
+     tooltip="Exchange time the open is measured in. Use America/New_York for US stocks/futures/options.")
+sessionStartHour = input.int(9, "Session Start Hour (0-23, exchange time)", minval=0, maxval=23, group=grpSession)
+sessionStartMinute = input.int(30, "Session Start Minute", minval=0, maxval=59, group=grpSession)
+tradingWindowMinutes = input.int(60, "Stop looking for new entries after (minutes from open)", minval=1, group=grpSession,
+     tooltip="Only trades the first ~60 minutes of the session by default (up to 90-120 is reasonable too). No new entries are taken after this window.")
+flattenAtWindowEnd = input.bool(false, "Flatten any open position at window end", group=grpSession,
+     tooltip="Off by default: an open trade's stop trails the reference candle and is allowed to run past the entry window since the setup can still be developing. Turn on to force a hard flatten instead.")
+
+grpTrend = "Daily Trend Filter"
+tradeWithTrendOnly = input.bool(true, "Only trade with the daily trend (skip sideways days)", group=grpTrend,
+     tooltip="Off: ignores the daily trend filter entirely and allows both long and short setups any day, which is not what the strategy is built around.")
+pivotLeftBars = input.int(2, "Daily Swing Pivot Left Bars", minval=1, group=grpTrend)
+pivotRightBars = input.int(2, "Daily Swing Pivot Right Bars", minval=1, group=grpTrend,
+     tooltip="Swing highs/lows on the daily chart need this many bars after them to confirm, so the trend read lags by this many closed daily bars - normal for any swing-structure classification.")
+
+grpEntry = "Entry Model"
+useFullBody = input.bool(true, "Mark reference candle by its full body (recommended)", group=grpEntry,
+     tooltip="On: the reference zone is the candle's open-to-close body (simpler, more retest room). Off: the zone is only the wick beyond the body (shallower pullback required, higher-probability but fewer trades).")
+requireHoldClose = input.bool(true, "Require the retest candle to close back in the trend direction", group=grpEntry,
+     tooltip="On: the retest candle must itself close green (for a long) or red (for a short) and stay on the right side of the reference zone - this is the 'holding support/resistance' the strategy looks for. Off: any touch of the zone after bias is confirmed triggers an entry.")
+
+grpRisk = "Risk / Sizing"
+riskPerTradePct = input.float(1.0, "Risk per trade (% of equity)", minval=0.05, step=0.05, group=grpRisk,
+     tooltip="Position size is derived from this and the trade's actual stop distance rather than a flat share/contract count.")
+riskMultiple = input.float(2.0, "Reward multiple (x initial risk)", minval=0.5, step=0.1, group=grpRisk,
+     tooltip="Minimum reward-to-risk multiple required on every trade, e.g. 2.0 = at least 2x the initial risk. The target is fixed at entry and does not move.")
+useWiderStop = input.bool(false, "Use the reference candle's full wick as the stop (wider)", group=grpRisk,
+     tooltip="Off (default): stop is the reference candle's body edge (its close, for a down-close reference). On: stop is the candle's full extreme (its low/high) instead, a wider and more conservative placement.")
+stopBufferTicks = input.float(0, "Extra stop buffer beyond the reference level (ticks)", minval=0, group=grpRisk)
+trailStopWithReference = input.bool(true, "Trail the stop as a newer reference candle forms", group=grpRisk,
+     tooltip="On: while a trade is open, if a fresh, better reference candle forms in the trade's direction, the stop ratchets to it (never loosens). Off: the stop stays fixed at its initial entry level.")
+oneTradePerDay = input.bool(false, "One trade per day (stop after first setup resolves)", group=grpRisk,
+     tooltip="Off by default: the strategy is meant to keep taking fresh retest entries off newer reference candles as the trend continues through the window, not stop after one trade.")
+
+grpDisplay = "Display"
+showRefLines = input.bool(true, "Show reference candle zone lines", group=grpDisplay)
+showTradeLevels = input.bool(true, "Show entry/stop/target lines", group=grpDisplay)
+showDashboard = input.bool(true, "Show dashboard", group=grpDisplay)
+
+// ---- Daily trend bias ----
+
+dailyBias = request.security(syminfo.tickerid, "D", f_dailyBias(pivotLeftBars, pivotRightBars), lookahead=barmerge.lookahead_off)
+
+// ---- Session tracking ----
+
+barHour = hour(time, sessionTz)
+barMinute = minute(time, sessionTz)
+minutesSinceOpen = (barHour * 60 + barMinute) - (sessionStartHour * 60 + sessionStartMinute)
+
+dateId = year(time, sessionTz) * 10000 + month(time, sessionTz) * 100 + dayofmonth(time, sessionTz)
+newDay = ta.change(dateId) != 0
+
+var float refTopLong = na
+var float refBottomLong = na
+var float refExtremeLongLow = na
+var float refTopShort = na
+var float refBottomShort = na
+var float refExtremeShortHigh = na
+var bool  entryTakenToday = false
+
+if newDay
+    refTopLong := na
+    refBottomLong := na
+    refExtremeLongLow := na
+    refTopShort := na
+    refBottomShort := na
+    refExtremeShortHigh := na
+    entryTakenToday := false
+
+// ---- Reference candle tracking (trails favorably as the trend continues) ----
+
+inSessionHours = minutesSinceOpen >= 0
+isDownClose = close < open
+isUpClose = close > open
+
+if inSessionHours and isDownClose
+    zoneBottomL = useFullBody ? close : open
+    zoneTopL = useFullBody ? open : high
+    if na(refBottomLong) or zoneBottomL > refBottomLong
+        refBottomLong := zoneBottomL
+        refTopLong := zoneTopL
+        refExtremeLongLow := low
+
+if inSessionHours and isUpClose
+    zoneTopS = useFullBody ? close : open
+    zoneBottomS = useFullBody ? open : low
+    if na(refTopShort) or zoneTopS < refTopShort
+        refTopShort := zoneTopS
+        refBottomShort := zoneBottomS
+        refExtremeShortHigh := high
+
+// ---- Retest & entry ----
+
+longRetest = not na(refTopLong) and low <= refTopLong and (not requireHoldClose or (close > open and close > refBottomLong))
+shortRetest = not na(refTopShort) and high >= refBottomShort and (not requireHoldClose or (close < open and close < refTopShort))
+
+allowLong = (not tradeWithTrendOnly) or dailyBias == "up"
+allowShort = (not tradeWithTrendOnly) or dailyBias == "down"
+
+canEnter = strategy.position_size == 0 and minutesSinceOpen >= 0 and minutesSinceOpen < tradingWindowMinutes and not (oneTradePerDay and entryTakenToday)
+enterLongNow = canEnter and allowLong and longRetest
+enterShortNow = canEnter and allowShort and shortRetest
+
+var float entryPrice = na
+var float stopPriceFinal = na
+var float targetPriceFinal = na
+
+if enterLongNow
+    stopBase = useWiderStop ? refExtremeLongLow : refBottomLong
+    riskPerShare = math.max(close - stopBase + stopBufferTicks * syminfo.mintick, syminfo.mintick)
+    riskAmount = strategy.equity * riskPerTradePct / 100
+    qty = riskAmount / riskPerShare
+    strategy.entry("Long", strategy.long, qty=qty)
+    entryPrice := close
+    stopPriceFinal := close - riskPerShare
+    targetPriceFinal := close + riskPerShare * riskMultiple
+    entryTakenToday := true
+
+if enterShortNow
+    stopBase = useWiderStop ? refExtremeShortHigh : refTopShort
+    riskPerShare = math.max(stopBase - close + stopBufferTicks * syminfo.mintick, syminfo.mintick)
+    riskAmount = strategy.equity * riskPerTradePct / 100
+    qty = riskAmount / riskPerShare
+    strategy.entry("Short", strategy.short, qty=qty)
+    entryPrice := close
+    stopPriceFinal := close + riskPerShare
+    targetPriceFinal := close - riskPerShare * riskMultiple
+    entryTakenToday := true
+
+// Trail the stop to the current reference level while the trade runs (never loosens it).
+if strategy.position_size > 0 and trailStopWithReference
+    liveStopLong = useWiderStop ? refExtremeLongLow : refBottomLong
+    if not na(liveStopLong)
+        stopPriceFinal := math.max(stopPriceFinal, liveStopLong)
+
+if strategy.position_size < 0 and trailStopWithReference
+    liveStopShort = useWiderStop ? refExtremeShortHigh : refTopShort
+    if not na(liveStopShort)
+        stopPriceFinal := math.min(stopPriceFinal, liveStopShort)
+
+strategy.exit("Long Exit", from_entry="Long", stop=stopPriceFinal, limit=targetPriceFinal)
+strategy.exit("Short Exit", from_entry="Short", stop=stopPriceFinal, limit=targetPriceFinal)
+
+if flattenAtWindowEnd and strategy.position_size != 0 and minutesSinceOpen >= tradingWindowMinutes
+    strategy.close_all(comment="Window flatten")
+
+if newDay and strategy.position_size != 0
+    strategy.close_all(comment="New day safety flatten")
+
+// ---- Alerts ----
+
+alertcondition(enterLongNow, title="OCR Long Entry", message="{{ticker}} one-candle-rule long retest entry on {{interval}} at {{close}}")
+alertcondition(enterShortNow, title="OCR Short Entry", message="{{ticker}} one-candle-rule short retest entry on {{interval}} at {{close}}")
+
+if enterLongNow
+    alert('{"event":"entry","strategy":"ocr60","side":"long","symbol":"' + syminfo.ticker + '","price":' + str.tostring(close) + ',"stop":' + str.tostring(stopPriceFinal) + ',"target":' + str.tostring(targetPriceFinal) + ',"time":"' + str.tostring(time) + '"}', alert.freq_once_per_bar_close)
+
+if enterShortNow
+    alert('{"event":"entry","strategy":"ocr60","side":"short","symbol":"' + syminfo.ticker + '","price":' + str.tostring(close) + ',"stop":' + str.tostring(stopPriceFinal) + ',"target":' + str.tostring(targetPriceFinal) + ',"time":"' + str.tostring(time) + '"}', alert.freq_once_per_bar_close)
+
+// ---- Plots ----
+
+plot(showRefLines ? refTopLong : na, "Long Reference Top", color=color.new(color.green, 0), style=plot.style_linebr, linewidth=1)
+plot(showRefLines ? refBottomLong : na, "Long Reference Bottom", color=color.new(color.green, 40), style=plot.style_linebr, linewidth=1)
+plot(showRefLines ? refTopShort : na, "Short Reference Top", color=color.new(color.red, 40), style=plot.style_linebr, linewidth=1)
+plot(showRefLines ? refBottomShort : na, "Short Reference Bottom", color=color.new(color.red, 0), style=plot.style_linebr, linewidth=1)
+
+tradeEntryPlot = strategy.position_size != 0 ? entryPrice : na
+tradeStopPlot = strategy.position_size != 0 ? stopPriceFinal : na
+tradeTargetPlot = strategy.position_size != 0 ? targetPriceFinal : na
+
+plot(showTradeLevels ? tradeEntryPlot : na, "Entry Price", color=color.new(color.gray, 20), style=plot.style_linebr, linewidth=1)
+plot(showTradeLevels ? tradeStopPlot : na, "Stop Loss", color=color.new(color.red, 0), style=plot.style_linebr, linewidth=2)
+plot(showTradeLevels ? tradeTargetPlot : na, "Take Profit", color=color.new(color.green, 0), style=plot.style_linebr, linewidth=2)
+
+plotshape(enterLongNow, title="Long Entry", style=shape.triangleup, location=location.belowbar,
+     color=color.new(color.green, 0), size=size.small)
+plotshape(enterShortNow, title="Short Entry", style=shape.triangledown, location=location.abovebar,
+     color=color.new(color.red, 0), size=size.small)
+
+if showTradeLevels and enterLongNow
+    label.new(bar_index, stopPriceFinal, "SL " + str.tostring(stopPriceFinal, format.mintick),
+         style=label.style_label_down, color=color.new(color.red, 15), textcolor=color.white, size=size.tiny)
+    label.new(bar_index, targetPriceFinal, "TP " + str.tostring(targetPriceFinal, format.mintick),
+         style=label.style_label_up, color=color.new(color.green, 15), textcolor=color.white, size=size.tiny)
+
+if showTradeLevels and enterShortNow
+    label.new(bar_index, stopPriceFinal, "SL " + str.tostring(stopPriceFinal, format.mintick),
+         style=label.style_label_up, color=color.new(color.red, 15), textcolor=color.white, size=size.tiny)
+    label.new(bar_index, targetPriceFinal, "TP " + str.tostring(targetPriceFinal, format.mintick),
+         style=label.style_label_down, color=color.new(color.green, 15), textcolor=color.white, size=size.tiny)
+
+// ---- Dashboard ----
+
+var table dash = table.new(position.top_right, 2, 7, border_width=1)
+
+if showDashboard and barstate.islast
+    table.cell(dash, 0, 0, "Daily Bias", bgcolor=color.gray, text_color=color.white)
+    table.cell(dash, 1, 0, dailyBias == "up" ? "Up" : dailyBias == "down" ? "Down" : "Sideways",
+         bgcolor=dailyBias == "up" ? color.new(color.green, 60) : dailyBias == "down" ? color.new(color.red, 60) : color.new(color.gray, 70))
+
+    table.cell(dash, 0, 1, "Long Ref Zone", bgcolor=color.gray, text_color=color.white)
+    table.cell(dash, 1, 1, na(refBottomLong) ? "n/a" : str.tostring(refBottomLong, format.mintick) + " - " + str.tostring(refTopLong, format.mintick))
+
+    table.cell(dash, 0, 2, "Short Ref Zone", bgcolor=color.gray, text_color=color.white)
+    table.cell(dash, 1, 2, na(refBottomShort) ? "n/a" : str.tostring(refBottomShort, format.mintick) + " - " + str.tostring(refTopShort, format.mintick))
+
+    table.cell(dash, 0, 3, "Minutes Since Open", bgcolor=color.gray, text_color=color.white)
+    table.cell(dash, 1, 3, str.tostring(minutesSinceOpen))
+
+    inWindow = minutesSinceOpen >= 0 and minutesSinceOpen < tradingWindowMinutes
+    table.cell(dash, 0, 4, "In Trading Window", bgcolor=color.gray, text_color=color.white)
+    table.cell(dash, 1, 4, inWindow ? "Yes" : "No",
+         bgcolor=inWindow ? color.new(color.green, 60) : color.new(color.gray, 70))
+
+    table.cell(dash, 0, 5, "Entries Today", bgcolor=color.gray, text_color=color.white)
+    table.cell(dash, 1, 5, entryTakenToday ? "1+" : "0")
+
+    tfOk = timeframe.in_seconds(timeframe.period) <= 60
+    table.cell(dash, 0, 6, "Chart Timeframe", bgcolor=color.gray, text_color=color.white)
+    table.cell(dash, 1, 6, timeframe.period + (tfOk ? "" : " (use 1min)"),
+         bgcolor=tfOk ? color.new(color.green, 60) : color.new(color.orange, 50))
+
+// This Pine Script code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/

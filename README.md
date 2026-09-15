@@ -130,12 +130,21 @@ signals before considering live mode.
   added for bot integration.
 - `pine/ORB_930_Retest.pine` — a separate, standalone Pine strategy (not wired
   to the bot below, which is crypto/Kraken-specific): a 9:30 AM opening-range
-  breakout + retest scalper for the regular equities/futures cash session,
-  based on the mechanical rules from a Scarface Trades YouTube video. Marks
-  the first N minutes' high/low as the day's range, waits for a directional
-  close beyond it, then enters on a retest that shows a rejection back in the
-  breakout direction, with a risk-based position size and a fixed R-multiple
-  target. Meant to be run/backtested on its own chart (1-minute recommended).
+  breakout + retest scalper for the regular equities/futures cash session.
+  Marks the first N minutes' high/low as the day's range, waits for a
+  directional close beyond it, then enters on a retest that shows a rejection
+  back in the breakout direction, with a risk-based position size and a fixed
+  R-multiple target. Meant to be run/backtested on its own chart (1-minute
+  recommended).
+- `pine/OneCandleRule_TrendScalp.pine` — another standalone Pine strategy
+  (same disclaimer: not wired to the bot). A three-step trend-pullback
+  scalper: (1) classifies the daily trend from swing structure and skips
+  sideways days, (2) on the 1-minute chart, tracks a single trailing
+  reference candle - the most recent down-close candle at a new high in an
+  uptrend, or up-close candle at a new low in a downtrend - and enters when
+  price retests that candle's zone and holds, (3) risk-based sizing with a
+  fixed reward multiple and a stop that trails the reference candle as the
+  trend continues. Also 1-minute-chart recommended.
 - `bot/config.py` — all settings, loaded from `.env`.
 - `bot/kraken_client.py` — thin ccxt wrapper (public price data + private orders).
 - `bot/broker.py` — `PaperBroker` (simulated fills) / `LiveBroker` (real orders).
