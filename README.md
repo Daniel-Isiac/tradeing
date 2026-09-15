@@ -156,6 +156,16 @@ signals before considering live mode.
   level and closes back on the trend side, with risk-based sizing and a
   fixed reward multiple. Intended for a short intraday timeframe (30
   seconds to a few minutes).
+- `pine/VWAPDeviationReversion.pine` — a strategy conversion of a
+  third-party volume-weighted deviation-band indicator (not wired to the
+  bot). Keeps the original's core calculation (a rolling, volume-weighted
+  mean and mean-absolute-deviation bands, optionally in log-price space),
+  RSI/volume/market-regime filters, and session breakdown unchanged, and
+  adds an actual stop/target/position-sizing layer: enter on a 2-sigma or
+  3-sigma band touch with RSI + volume + regime confirmation, ATR-based
+  stop, and a take-profit that trails the rolling mean until hit (or a
+  fixed reward multiple instead). Works on any timeframe/instrument the
+  underlying indicator did.
 - `bot/config.py` — all settings, loaded from `.env`.
 - `bot/kraken_client.py` — thin ccxt wrapper (public price data + private orders).
 - `bot/broker.py` — `PaperBroker` (simulated fills) / `LiveBroker` (real orders).
