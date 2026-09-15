@@ -166,6 +166,25 @@ signals before considering live mode.
   stop, and a take-profit that trails the rolling mean until hit (or a
   fixed reward multiple instead). Works on any timeframe/instrument the
   underlying indicator did.
+- `pine/ORB_PriorDayRetest.pine` — a different, more sophisticated ORB
+  strategy: breaks of the prior day's high/low (not an opening range),
+  gated by a minimum ATR-multiple breakout distance, then an armed
+  state machine waits for a retest of the level (tolerance in ATR) before
+  entering, with an ATR-buffered stop and a fixed reward multiple. Ported
+  to Python in `backtest/` for multi-ticker backtesting (see below).
+
+## Multi-ticker backtesting (`backtest/`)
+
+`backtest/` is a standalone Python port of `pine/ORB_PriorDayRetest.pine`
+that runs the strategy across many tickers at once instead of one symbol at
+a time in TradingView's Strategy Tester, bar-by-bar (not vectorized/
+approximated), including the Pine script's exact next-bar-open order-fill
+timing. See `backtest/README.md` for full usage, CLI flags, and fidelity
+notes — including an important caveat: free sources cap 1-minute equity
+history at ~30 days (verified against both Yahoo Finance and this session's
+data connector), so a true 365-day/1-minute backtest needs a paid data
+vendor or a broker's historical export; the engine itself is data-source
+agnostic and just needs OHLCV CSVs.
 - `bot/config.py` — all settings, loaded from `.env`.
 - `bot/kraken_client.py` — thin ccxt wrapper (public price data + private orders).
 - `bot/broker.py` — `PaperBroker` (simulated fills) / `LiveBroker` (real orders).

@@ -5,3 +5,7 @@ __pycache__/
 venv/
 bot_state.json
 trade_log.csv
+
+# Backtest market data and generated results - regenerate locally, don't commit
+backtest/data/*.csv
+backtest/results/*.csv
