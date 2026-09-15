@@ -145,6 +145,17 @@ signals before considering live mode.
   price retests that candle's zone and holds, (3) risk-based sizing with a
   fixed reward multiple and a stop that trails the reference candle as the
   trend continues. Also 1-minute-chart recommended.
+- `pine/LiquiditySweepOrderBlock.pine` — another standalone Pine strategy
+  (same disclaimer: not wired to the bot). Combines three confluences: (1)
+  swing-pivot trend structure that only flips on a second broken swing
+  low/high (a single broken pullback level is read as a stop-loss sweep and
+  a continuation entry, not a reversal), (2) optional order-block zones -
+  a small consolidation candle immediately followed by a large directional
+  candle - as a confluence filter, and (3) an optional session-VWAP
+  directional filter. Enters when price wicks through the current sweep
+  level and closes back on the trend side, with risk-based sizing and a
+  fixed reward multiple. Intended for a short intraday timeframe (30
+  seconds to a few minutes).
 - `bot/config.py` — all settings, loaded from `.env`.
 - `bot/kraken_client.py` — thin ccxt wrapper (public price data + private orders).
 - `bot/broker.py` — `PaperBroker` (simulated fills) / `LiveBroker` (real orders).

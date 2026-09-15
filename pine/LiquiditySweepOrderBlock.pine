@@ -1,0 +1,358 @@
+// Liquidity Sweep + Order Block Scalper
+//
+// Three-concept mechanical intraday strategy:
+//
+//   1. Trend structure via liquidity: a classic "higher high + higher low"
+//      read of trend is too fragile - price routinely dips below the most
+//      recent pullback low (running the stops resting there) before
+//      continuing the trend, without that actually being a real reversal.
+//      This strategy tracks swing pivots and treats the trend as intact
+//      until TWO distinct swing lows (in an uptrend) or highs (in a
+//      downtrend) are broken, not just one. The most recent pullback level
+//      is the "sweep" reference: a candle that wicks through it and closes
+//      back on the trend side is read as trapped stop-loss orders getting
+//      run, not a real breakout, and is the entry trigger.
+//   2. Order blocks / trapped traders: a small consolidation candle
+//      immediately followed by a large, strongly directional candle marks
+//      an area where traders on the wrong side of that move are now
+//      underwater. When price later returns to that consolidation zone,
+//      those trapped positions tend to get closed out, pushing price back
+//      in the impulse direction. This is tracked as an optional confluence
+//      zone for the sweep entry above.
+//   3. VWAP as a bull/bear line: session-anchored VWAP is used as a simple
+//      directional filter - longs only above it, shorts only below it.
+//
+// Position sizing is risk-based (a fixed % of equity divided by the trade's
+// actual stop distance) rather than a flat share/contract count.
+//
+// Works on any instrument/timeframe combination as long as the chart is a
+// short intraday timeframe (30 seconds to a few minutes) so the swing
+// pivots and order blocks are built from real intraday structure, not
+// multi-day swings.
+//
+// NON-REPAINTING: calc_on_every_tick is disabled - every signal locks in at
+// bar close. Swing pivots necessarily confirm only after enough bars have
+// printed on both sides of them (a structural fact of pivot detection, not
+// a repaint), so the tracked levels always lag the live price by that many
+// bars - the entry trigger itself (price sweeping and reclaiming an
+// already-known level) is real-time and non-repainting.
+//
+// Past performance in the Strategy Tester is hypothetical and not
+// indicative of future results. Research/education tool only, not
+// financial advice.
+
+//@version=6
+strategy("Liquidity Sweep + Order Block Scalper", shorttitle="LSOB", overlay=true,
+     calc_on_every_tick=false, process_orders_on_close=true,
+     default_qty_type=strategy.percent_of_equity, default_qty_value=10,
+     initial_capital=25000, commission_type=strategy.commission.cash_per_order,
+     commission_value=0, slippage=1, max_labels_count=500)
+
+// ---- Inputs ----
+
+grpSession = "Session"
+sessionTz = input.string("America/New_York", "Session Timezone", group=grpSession,
+     tooltip="Exchange time the open is measured in. Use America/New_York for US stocks/futures/options.")
+sessionStartHour = input.int(9, "Session Start Hour (0-23, exchange time)", minval=0, maxval=23, group=grpSession)
+sessionStartMinute = input.int(30, "Session Start Minute", minval=0, maxval=59, group=grpSession)
+tradingWindowMinutes = input.int(60, "Stop looking for new entries after (minutes from open)", minval=1, group=grpSession,
+     tooltip="Only trades the first hour of the session by default, matching an opening-session scalp. Increase if trading a later, calmer session too.")
+flattenAtWindowEnd = input.bool(false, "Flatten any open position at window end", group=grpSession,
+     tooltip="Off by default: an open trade is managed by its own stop/target and allowed to run past the entry window. Turn on to force a hard flatten instead.")
+
+grpStructure = "Trend Structure"
+pivotBars = input.int(3, "Swing Pivot Bars (left = right)", minval=1, group=grpStructure,
+     tooltip="How many bars on each side confirm a swing high/low on THIS chart's timeframe. Smaller = more, faster, noisier pivots; larger = fewer, slower, more significant ones.")
+tradeWithTrendOnly = input.bool(true, "Only trade with the current trend structure", group=grpStructure,
+     tooltip="Off: allows both long and short sweep setups regardless of trend classification.")
+
+grpOB = "Order Blocks"
+useOrderBlocks = input.bool(true, "Track order blocks (consolidation + impulse)", group=grpOB,
+     tooltip="Marks a small-range candle immediately followed by a large, strongly directional candle as an order block zone - the area where traders on the wrong side of that move are trapped.")
+obAtrLen = input.int(14, "ATR Length for order block detection", minval=1, group=grpOB)
+obBaseMaxAtrMult = input.float(0.6, "Max base-candle range (x ATR) to count as consolidation", minval=0.05, step=0.05, group=grpOB)
+obImpulseMinAtrMult = input.float(1.5, "Min impulse-candle range (x ATR) to count as a breakout", minval=0.5, step=0.1, group=grpOB)
+requireOrderBlockConfluence = input.bool(false, "Require the sweep entry to overlap a recent order block zone", group=grpOB,
+     tooltip="On: only take a sweep entry if it also dips into the most recent order block zone on that side - a stricter, lower-frequency 'order zone' setup combining both concepts.")
+
+grpVwap = "VWAP Filter"
+useVwapFilter = input.bool(true, "Only trade in the direction of session VWAP", group=grpVwap,
+     tooltip="On: longs only above session VWAP, shorts only below it - the simple bull/bear line filter.")
+
+grpRisk = "Risk / Sizing"
+requireReclaimClose = input.bool(true, "Require the sweep candle to close in the trend direction", group=grpRisk,
+     tooltip="On: the sweep-and-reclaim candle must also close green (for a long) or red (for a short), not just close back on the right side of the level.")
+riskPerTradePct = input.float(1.0, "Risk per trade (% of equity)", minval=0.05, step=0.05, group=grpRisk)
+riskMultiple = input.float(2.0, "Reward multiple (x initial risk)", minval=0.5, step=0.1, group=grpRisk)
+stopBufferTicks = input.float(0, "Extra stop buffer beyond the sweep wick (ticks)", minval=0, group=grpRisk)
+oneTradePerDay = input.bool(false, "One trade per day (stop after first setup resolves)", group=grpRisk,
+     tooltip="Off by default: a trend can produce more than one valid sweep as it continues through the window.")
+
+grpDisplay = "Display"
+showLevels = input.bool(true, "Show structure/sweep levels", group=grpDisplay)
+showOrderBlocks = input.bool(true, "Show order block zones", group=grpDisplay)
+showVwap = input.bool(true, "Show VWAP", group=grpDisplay)
+showTradeLevels = input.bool(true, "Show entry/stop/target lines", group=grpDisplay)
+showDashboard = input.bool(true, "Show dashboard", group=grpDisplay)
+
+// ---- Session tracking ----
+
+barHour = hour(time, sessionTz)
+barMinute = minute(time, sessionTz)
+minutesSinceOpen = (barHour * 60 + barMinute) - (sessionStartHour * 60 + sessionStartMinute)
+
+dateId = year(time, sessionTz) * 10000 + month(time, sessionTz) * 100 + dayofmonth(time, sessionTz)
+newDay = ta.change(dateId) != 0
+
+// ---- Trend structure via swing pivots (the "two lows/highs to break" rule) ----
+
+ph = ta.pivothigh(high, pivotBars, pivotBars)
+pl = ta.pivotlow(low, pivotBars, pivotBars)
+
+var float lowA = na
+var float lowB = na
+var float highA = na
+var float highB = na
+var string trendState = "undefined"
+var float structLow = na
+var float sweepLow = na
+var float structHigh = na
+var float sweepHigh = na
+var bool  sweepLongUsed = false
+var bool  sweepShortUsed = false
+var bool  entryTakenToday = false
+
+if newDay
+    lowA := na
+    lowB := na
+    highA := na
+    highB := na
+    trendState := "undefined"
+    structLow := na
+    sweepLow := na
+    structHigh := na
+    sweepHigh := na
+    sweepLongUsed := false
+    sweepShortUsed := false
+    entryTakenToday := false
+
+if not na(pl)
+    lowA := lowB
+    lowB := pl
+    if trendState == "up"
+        if lowB <= structLow
+            trendState := "down"
+            structHigh := highA
+            sweepHigh := highB
+            sweepShortUsed := false
+            structLow := na
+            sweepLow := na
+        else
+            sweepLow := lowB
+            sweepLongUsed := false
+    else if trendState == "undefined" and not na(lowA) and not na(highA) and not na(highB)
+        if highB > highA and lowB > lowA
+            trendState := "up"
+            structLow := lowA
+            sweepLow := lowB
+        else if highB < highA and lowB < lowA
+            trendState := "down"
+            structHigh := highA
+            sweepHigh := highB
+
+if not na(ph)
+    highA := highB
+    highB := ph
+    if trendState == "down"
+        if highB >= structHigh
+            trendState := "up"
+            structLow := lowA
+            sweepLow := lowB
+            sweepLongUsed := false
+            structHigh := na
+            sweepHigh := na
+        else
+            sweepHigh := highB
+            sweepShortUsed := false
+    else if trendState == "undefined" and not na(lowA) and not na(lowB) and not na(highA)
+        if highB > highA and lowB > lowA
+            trendState := "up"
+            structLow := lowA
+            sweepLow := lowB
+        else if highB < highA and lowB < lowA
+            trendState := "down"
+            structHigh := highA
+            sweepHigh := highB
+
+// ---- Order blocks (consolidation immediately followed by a large impulse) ----
+
+atrVal = ta.atr(obAtrLen)
+prevRange = high[1] - low[1]
+curRange = high - low
+isPrevBase = prevRange <= atrVal * obBaseMaxAtrMult
+isImpulseUp = curRange >= atrVal * obImpulseMinAtrMult and close > open and (close - open) >= curRange * 0.6
+isImpulseDown = curRange >= atrVal * obImpulseMinAtrMult and close < open and (open - close) >= curRange * 0.6
+
+var float obLongTop = na
+var float obLongBottom = na
+var float obShortTop = na
+var float obShortBottom = na
+
+if newDay
+    obLongTop := na
+    obLongBottom := na
+    obShortTop := na
+    obShortBottom := na
+
+if useOrderBlocks and isPrevBase and isImpulseUp
+    obLongTop := high[1]
+    obLongBottom := low[1]
+
+if useOrderBlocks and isPrevBase and isImpulseDown
+    obShortTop := high[1]
+    obShortBottom := low[1]
+
+// ---- VWAP ----
+
+vwapValue = ta.vwap(hlc3)
+
+// ---- Sweep entry signals ----
+
+longSweepSignal = not na(sweepLow) and low < sweepLow and close > sweepLow and (not requireReclaimClose or close > open)
+shortSweepSignal = not na(sweepHigh) and high > sweepHigh and close < sweepHigh and (not requireReclaimClose or close < open)
+
+obLongConfluence = not requireOrderBlockConfluence or (not na(obLongBottom) and low <= obLongTop)
+obShortConfluence = not requireOrderBlockConfluence or (not na(obShortTop) and high >= obShortBottom)
+
+allowLongTrend = (not tradeWithTrendOnly) or trendState == "up"
+allowShortTrend = (not tradeWithTrendOnly) or trendState == "down"
+
+allowLongVwap = (not useVwapFilter) or close > vwapValue
+allowShortVwap = (not useVwapFilter) or close < vwapValue
+
+canEnter = strategy.position_size == 0 and minutesSinceOpen >= 0 and minutesSinceOpen < tradingWindowMinutes and not (oneTradePerDay and entryTakenToday)
+
+enterLongNow = canEnter and allowLongTrend and allowLongVwap and longSweepSignal and obLongConfluence and not sweepLongUsed
+enterShortNow = canEnter and allowShortTrend and allowShortVwap and shortSweepSignal and obShortConfluence and not sweepShortUsed
+
+var float entryPrice = na
+var float stopPriceFinal = na
+var float targetPriceFinal = na
+
+if enterLongNow
+    riskPerShare = math.max(close - low + stopBufferTicks * syminfo.mintick, syminfo.mintick)
+    riskAmount = strategy.equity * riskPerTradePct / 100
+    qty = riskAmount / riskPerShare
+    strategy.entry("Long", strategy.long, qty=qty)
+    entryPrice := close
+    stopPriceFinal := low - stopBufferTicks * syminfo.mintick
+    targetPriceFinal := close + riskPerShare * riskMultiple
+    entryTakenToday := true
+    sweepLongUsed := true
+
+if enterShortNow
+    riskPerShare = math.max(high - close + stopBufferTicks * syminfo.mintick, syminfo.mintick)
+    riskAmount = strategy.equity * riskPerTradePct / 100
+    qty = riskAmount / riskPerShare
+    strategy.entry("Short", strategy.short, qty=qty)
+    entryPrice := close
+    stopPriceFinal := high + stopBufferTicks * syminfo.mintick
+    targetPriceFinal := close - riskPerShare * riskMultiple
+    entryTakenToday := true
+    sweepShortUsed := true
+
+strategy.exit("Long Exit", from_entry="Long", stop=stopPriceFinal, limit=targetPriceFinal)
+strategy.exit("Short Exit", from_entry="Short", stop=stopPriceFinal, limit=targetPriceFinal)
+
+if flattenAtWindowEnd and strategy.position_size != 0 and minutesSinceOpen >= tradingWindowMinutes
+    strategy.close_all(comment="Window flatten")
+
+if newDay and strategy.position_size != 0
+    strategy.close_all(comment="New day safety flatten")
+
+// ---- Alerts ----
+
+alertcondition(enterLongNow, title="LSOB Long Entry", message="{{ticker}} liquidity sweep long entry on {{interval}} at {{close}}")
+alertcondition(enterShortNow, title="LSOB Short Entry", message="{{ticker}} liquidity sweep short entry on {{interval}} at {{close}}")
+
+if enterLongNow
+    alert('{"event":"entry","strategy":"lsob","side":"long","symbol":"' + syminfo.ticker + '","price":' + str.tostring(close) + ',"stop":' + str.tostring(stopPriceFinal) + ',"target":' + str.tostring(targetPriceFinal) + ',"time":"' + str.tostring(time) + '"}', alert.freq_once_per_bar_close)
+
+if enterShortNow
+    alert('{"event":"entry","strategy":"lsob","side":"short","symbol":"' + syminfo.ticker + '","price":' + str.tostring(close) + ',"stop":' + str.tostring(stopPriceFinal) + ',"target":' + str.tostring(targetPriceFinal) + ',"time":"' + str.tostring(time) + '"}', alert.freq_once_per_bar_close)
+
+// ---- Plots ----
+
+plot(showLevels ? sweepLow : na, "Sweep Low", color=color.new(color.green, 0), style=plot.style_linebr, linewidth=1)
+plot(showLevels ? structLow : na, "Structural Low", color=color.new(color.green, 55), style=plot.style_linebr, linewidth=1)
+plot(showLevels ? sweepHigh : na, "Sweep High", color=color.new(color.red, 0), style=plot.style_linebr, linewidth=1)
+plot(showLevels ? structHigh : na, "Structural High", color=color.new(color.red, 55), style=plot.style_linebr, linewidth=1)
+
+plot(showOrderBlocks ? obLongTop : na, "Bull OB Top", color=color.new(color.teal, 30), style=plot.style_linebr, linewidth=1)
+plot(showOrderBlocks ? obLongBottom : na, "Bull OB Bottom", color=color.new(color.teal, 30), style=plot.style_linebr, linewidth=1)
+plot(showOrderBlocks ? obShortTop : na, "Bear OB Top", color=color.new(color.maroon, 30), style=plot.style_linebr, linewidth=1)
+plot(showOrderBlocks ? obShortBottom : na, "Bear OB Bottom", color=color.new(color.maroon, 30), style=plot.style_linebr, linewidth=1)
+
+plot(showVwap ? vwapValue : na, "VWAP", color=color.new(color.blue, 0), linewidth=2)
+
+tradeEntryPlot = strategy.position_size != 0 ? entryPrice : na
+tradeStopPlot = strategy.position_size != 0 ? stopPriceFinal : na
+tradeTargetPlot = strategy.position_size != 0 ? targetPriceFinal : na
+
+plot(showTradeLevels ? tradeEntryPlot : na, "Entry Price", color=color.new(color.gray, 20), style=plot.style_linebr, linewidth=1)
+plot(showTradeLevels ? tradeStopPlot : na, "Stop Loss", color=color.new(color.red, 0), style=plot.style_linebr, linewidth=2)
+plot(showTradeLevels ? tradeTargetPlot : na, "Take Profit", color=color.new(color.green, 0), style=plot.style_linebr, linewidth=2)
+
+plotshape(enterLongNow, title="Long Entry", style=shape.triangleup, location=location.belowbar,
+     color=color.new(color.green, 0), size=size.small)
+plotshape(enterShortNow, title="Short Entry", style=shape.triangledown, location=location.abovebar,
+     color=color.new(color.red, 0), size=size.small)
+
+if showTradeLevels and enterLongNow
+    label.new(bar_index, stopPriceFinal, "SL " + str.tostring(stopPriceFinal, format.mintick),
+         style=label.style_label_down, color=color.new(color.red, 15), textcolor=color.white, size=size.tiny)
+    label.new(bar_index, targetPriceFinal, "TP " + str.tostring(targetPriceFinal, format.mintick),
+         style=label.style_label_up, color=color.new(color.green, 15), textcolor=color.white, size=size.tiny)
+
+if showTradeLevels and enterShortNow
+    label.new(bar_index, stopPriceFinal, "SL " + str.tostring(stopPriceFinal, format.mintick),
+         style=label.style_label_up, color=color.new(color.red, 15), textcolor=color.white, size=size.tiny)
+    label.new(bar_index, targetPriceFinal, "TP " + str.tostring(targetPriceFinal, format.mintick),
+         style=label.style_label_down, color=color.new(color.green, 15), textcolor=color.white, size=size.tiny)
+
+// ---- Dashboard ----
+
+var table dash = table.new(position.top_right, 2, 8, border_width=1)
+
+if showDashboard and barstate.islast
+    table.cell(dash, 0, 0, "Trend", bgcolor=color.gray, text_color=color.white)
+    table.cell(dash, 1, 0, trendState == "up" ? "Up" : trendState == "down" ? "Down" : "Undefined",
+         bgcolor=trendState == "up" ? color.new(color.green, 60) : trendState == "down" ? color.new(color.red, 60) : color.new(color.gray, 70))
+
+    table.cell(dash, 0, 1, "Sweep Low", bgcolor=color.gray, text_color=color.white)
+    table.cell(dash, 1, 1, na(sweepLow) ? "n/a" : str.tostring(sweepLow, format.mintick))
+
+    table.cell(dash, 0, 2, "Sweep High", bgcolor=color.gray, text_color=color.white)
+    table.cell(dash, 1, 2, na(sweepHigh) ? "n/a" : str.tostring(sweepHigh, format.mintick))
+
+    table.cell(dash, 0, 3, "VWAP", bgcolor=color.gray, text_color=color.white)
+    table.cell(dash, 1, 3, str.tostring(vwapValue, format.mintick),
+         bgcolor=close > vwapValue ? color.new(color.green, 60) : color.new(color.red, 60))
+
+    table.cell(dash, 0, 4, "Bull OB Zone", bgcolor=color.gray, text_color=color.white)
+    table.cell(dash, 1, 4, na(obLongBottom) ? "n/a" : str.tostring(obLongBottom, format.mintick) + " - " + str.tostring(obLongTop, format.mintick))
+
+    table.cell(dash, 0, 5, "Bear OB Zone", bgcolor=color.gray, text_color=color.white)
+    table.cell(dash, 1, 5, na(obShortBottom) ? "n/a" : str.tostring(obShortBottom, format.mintick) + " - " + str.tostring(obShortTop, format.mintick))
+
+    inWindow = minutesSinceOpen >= 0 and minutesSinceOpen < tradingWindowMinutes
+    table.cell(dash, 0, 6, "In Trading Window", bgcolor=color.gray, text_color=color.white)
+    table.cell(dash, 1, 6, inWindow ? "Yes" : "No",
+         bgcolor=inWindow ? color.new(color.green, 60) : color.new(color.gray, 70))
+
+    tfOk = timeframe.in_seconds(timeframe.period) <= 60
+    table.cell(dash, 0, 7, "Chart Timeframe", bgcolor=color.gray, text_color=color.white)
+    table.cell(dash, 1, 7, timeframe.period + (tfOk ? "" : " (use <=1min)"),
+         bgcolor=tfOk ? color.new(color.green, 60) : color.new(color.orange, 50))
+
+// This Pine Script code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
