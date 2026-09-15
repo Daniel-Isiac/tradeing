@@ -34,11 +34,26 @@ needs one CSV per ticker with the columns below. So the practical path is:
 2. Put them in `backtest/data/<TICKER>.csv`.
 3. Run `python engine.py`.
 
-If you want to scope down to what's actually free and available right now
-(e.g. 30 days of 1-minute bars via yfinance, or a longer lookback at 5/30
-minute bars), say so and a downloader script can be written against that -
-just flagging that the exact "365 days at 1 minute" spec needs a paid
-source or your own broker export.
+`download_data.py` is a ready-to-run downloader scoped to 30 days of
+1-minute bars (Yahoo's actual real limit) for a specific 67-ticker list.
+**It must be run on a machine with normal internet access** - this sandbox's
+network egress is restricted to package registries by policy, so Yahoo
+Finance is unreachable from here no matter what. On your own machine:
+
+```bash
+cd backtest
+pip install -r requirements.txt
+python download_data.py --out-dir data --days 30
+```
+
+This chunks each ticker's request into <=7-day windows (Yahoo's per-request
+cap for 1-minute data) and writes `data/<TICKER>.csv` in the schema below.
+One ticker in the list, `LILY34.SA` (a Brazilian BDR), is flagged in the
+script as likely to come back empty or thin - Yahoo's intraday coverage for
+foreign/BDR listings is generally poor, independent of this script.
+
+Once you have the CSVs, send them back (or hand me the `data/` folder) and
+the actual backtest runs with `python engine.py`.
 
 ## CSV format expected
 
