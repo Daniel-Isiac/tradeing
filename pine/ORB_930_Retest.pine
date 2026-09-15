@@ -1,0 +1,268 @@
+// 9:30 Opening Range Breakout + Retest Scalper
+//
+// ORIGINAL implementation of a publicly-taught trading concept — the "9:30 AM
+// 1-candle scalping strategy" explained in a Scarface Trades YouTube video —
+// not a copy of any proprietary indicator or source code. The rules below are
+// a direct, mechanical translation of what that video describes:
+//
+//   1. Mark the high/low of the first N minutes after the session open (the
+//      "9:30 candle" — 5 minutes by default, watched on the 1-minute chart).
+//   2. Wait for a directional break: price closes beyond that opening range
+//      on the execution timeframe. That sets the day's bias (long or short).
+//   3. Wait for a retest: price pulls back into the broken level and shows
+//      "weak price action" — a candle that touches the level but fails to
+//      reclaim it, closing back in the breakout direction. That candle is
+//      the entry.
+//   4. Stop-loss: the opposite extreme of the entry candle itself (its high
+//      for a short, its low for a long) — no fancy invalidation logic.
+//   5. Target: at least a 2R reward multiple (configurable), the stated
+//      minimum in the video ("for every $100 of risk, make $200").
+//   6. Only trade the first ~90 minutes after the open, one setup per day —
+//      the video is explicit that this is a short, mechanical session, not
+//      an all-day discretionary strategy.
+//
+// The video frames every example in dollars-of-risk-to-dollars-of-reward
+// terms ("risking $510 for $1,040"), so position sizing here is risk-based
+// (a fixed % of equity divided by the trade's actual stop distance) rather
+// than a flat share/contract count — a $0.20 stop and a $2 stop should not
+// buy the same size.
+//
+// Works on any instrument/timeframe combination as the video claims (stocks,
+// futures, forex, crypto) as long as the chart is run at or below the
+// opening-range length — the video itself executes on the 1-minute chart
+// while marking a 5-minute range, which is the recommended default here.
+//
+// NON-REPAINTING: calc_on_every_tick is disabled — every signal locks in at
+// bar close and won't appear-then-vanish intrabar.
+//
+// Past performance in the Strategy Tester is hypothetical and not indicative
+// of future results. Research/education tool only, not financial advice.
+
+//@version=6
+strategy("9:30 ORB Retest Scalper", shorttitle="ORB930", overlay=true,
+     calc_on_every_tick=false, process_orders_on_close=true,
+     default_qty_type=strategy.percent_of_equity, default_qty_value=10,
+     initial_capital=25000, commission_type=strategy.commission.cash_per_order,
+     commission_value=0, slippage=1, max_labels_count=500)
+
+// ───────────────────────────── Inputs ─────────────────────────────
+
+grpSession = "Session"
+sessionTz = input.string("America/New_York", "Session Timezone", group=grpSession,
+     tooltip="Exchange time the 9:30 open is measured in. Use America/New_York for US stocks/futures/options; change it if trading a different market's own open.")
+sessionStartHour = input.int(9, "Session Start Hour (0-23, exchange time)", minval=0, maxval=23, group=grpSession)
+sessionStartMinute = input.int(30, "Session Start Minute", minval=0, maxval=59, group=grpSession)
+orMinutes = input.int(5, "Opening Range Length (minutes)", minval=1, group=grpSession,
+     tooltip="Marks the high/low of the first N minutes after the session start as the day's opening range — 5 matches the video's '9:30 candle' on a 5-minute chart. Recommended: run this script on a 1-minute chart (like the video) so the breakout/retest logic has 1-minute close resolution.")
+tradingWindowMinutes = input.int(90, "Stop looking for new entries after (minutes from open)", minval=1, group=grpSession,
+     tooltip="The video only trades the first ~90 minutes of the session and is usually done well before that. No new entries are taken after this window. Must be greater than the opening range length above, or it's auto-corrected at runtime.")
+flattenAtWindowEnd = input.bool(true, "Flatten any open position at window end", group=grpSession)
+
+grpBreak = "Breakout / Bias"
+confirmBars = input.int(1, "Consecutive closes beyond OR to confirm bias", minval=1, maxval=5, group=grpBreak,
+     tooltip="The video calls for extra caution on a choppy open — e.g. requiring 2 closes back above the range after an initial fakeout (its day-4 example). Default 1 matches the clean-break examples; raise to 2+ to filter chop.")
+
+grpRetest = "Retest Entry"
+requireRejectionCandle = input.bool(true, "Require a rejection-direction close on the retest candle", group=grpRetest,
+     tooltip="On: the retest candle must close back in the breakout direction (e.g. a red close below the level, for a short) — this is the 'weak price action' the video looks for before entering. Off: any touch of the level after bias is confirmed triggers an entry (looser, more trades, more noise).")
+
+grpRisk = "Risk / Sizing"
+riskPerTradePct = input.float(1.0, "Risk per trade (% of equity)", minval=0.05, step=0.05, group=grpRisk,
+     tooltip="Position size is derived from this and the trade's actual stop distance (entry vs. the entry candle's high/low), matching how the video frames every trade ('risking $X to make $Y') rather than a flat share/contract count.")
+riskMultiple = input.float(2.0, "Reward multiple (x initial risk)", minval=0.5, step=0.1, group=grpRisk,
+     tooltip="The video's stated minimum: 'at least a 2R multiple, or low/high of day if further.' This backtest uses a fixed multiple as the mechanical, testable floor.")
+stopBufferTicks = input.float(0, "Extra stop buffer beyond entry candle (ticks)", minval=0, group=grpRisk,
+     tooltip="The video places the stop exactly at the entry candle's high/low with no buffer (0, the default). Add ticks here for a more realistic fill assumption.")
+oneTradePerDay = input.bool(true, "One trade per day (stop after first setup resolves)", group=grpRisk,
+     tooltip="Matches the video's '90 minutes and I'm done' discipline. Turn off to allow a second setup the same day once the first trade closes (bias resets and the strategy looks for a fresh break/retest).")
+
+grpDisplay = "Display"
+showOrLines = input.bool(true, "Show opening range lines", group=grpDisplay)
+showTradeLevels = input.bool(true, "Show entry/stop/target lines", group=grpDisplay)
+showDashboard = input.bool(true, "Show dashboard", group=grpDisplay)
+
+// ───────────────────────────── Session / opening range tracking ─────────────────────────────
+
+barHour = hour(time, sessionTz)
+barMinute = minute(time, sessionTz)
+minutesSinceOpen = (barHour * 60 + barMinute) - (sessionStartHour * 60 + sessionStartMinute)
+
+// Guards against a misconfigured window shorter than the range it must contain.
+effectiveWindow = math.max(tradingWindowMinutes, orMinutes + 1)
+
+dateId = year(time, sessionTz) * 10000 + month(time, sessionTz) * 100 + dayofmonth(time, sessionTz)
+newDay = ta.change(dateId) != 0
+
+var float orHigh = na
+var float orLow = na
+var bool  orLocked = false
+var string bias = ""
+var float breakLevel = na
+var int   upCloseCount = 0
+var int   downCloseCount = 0
+var bool  entryTakenToday = false
+
+if newDay
+    orHigh := na
+    orLow := na
+    orLocked := false
+    bias := ""
+    breakLevel := na
+    upCloseCount := 0
+    downCloseCount := 0
+    entryTakenToday := false
+
+inOrWindow = minutesSinceOpen >= 0 and minutesSinceOpen < orMinutes
+
+if inOrWindow
+    orHigh := na(orHigh) ? high : math.max(orHigh, high)
+    orLow := na(orLow) ? low : math.min(orLow, low)
+
+if not inOrWindow and minutesSinceOpen >= orMinutes and not orLocked and not na(orHigh)
+    orLocked := true
+
+// ───────────────────────────── Breakout / bias detection ─────────────────────────────
+
+if orLocked and bias == "" and minutesSinceOpen < effectiveWindow
+    if close > orHigh
+        upCloseCount := upCloseCount + 1
+        downCloseCount := 0
+    else if close < orLow
+        downCloseCount := downCloseCount + 1
+        upCloseCount := 0
+    else
+        upCloseCount := 0
+        downCloseCount := 0
+
+    if upCloseCount >= confirmBars
+        bias := "long"
+        breakLevel := orHigh
+    else if downCloseCount >= confirmBars
+        bias := "short"
+        breakLevel := orLow
+
+// ───────────────────────────── Retest & entry ─────────────────────────────
+
+longRetest = bias == "long" and low <= breakLevel and (not requireRejectionCandle or (close > breakLevel and close > open))
+shortRetest = bias == "short" and high >= breakLevel and (not requireRejectionCandle or (close < breakLevel and close < open))
+
+canEnter = strategy.position_size == 0 and minutesSinceOpen < effectiveWindow and not (oneTradePerDay and entryTakenToday)
+enterLongNow = canEnter and longRetest
+enterShortNow = canEnter and shortRetest
+
+var float entryPrice = na
+var float stopPriceFinal = na
+var float targetPriceFinal = na
+
+if enterLongNow
+    rawRisk = close - low
+    riskPerShare = math.max(rawRisk + stopBufferTicks * syminfo.mintick, syminfo.mintick)
+    riskAmount = strategy.equity * riskPerTradePct / 100
+    qty = riskAmount / riskPerShare
+    strategy.entry("Long", strategy.long, qty=qty)
+    entryPrice := close
+    stopPriceFinal := close - riskPerShare
+    targetPriceFinal := close + riskPerShare * riskMultiple
+    entryTakenToday := true
+
+if enterShortNow
+    rawRisk = high - close
+    riskPerShare = math.max(rawRisk + stopBufferTicks * syminfo.mintick, syminfo.mintick)
+    riskAmount = strategy.equity * riskPerTradePct / 100
+    qty = riskAmount / riskPerShare
+    strategy.entry("Short", strategy.short, qty=qty)
+    entryPrice := close
+    stopPriceFinal := close + riskPerShare
+    targetPriceFinal := close - riskPerShare * riskMultiple
+    entryTakenToday := true
+
+strategy.exit("Long Exit", from_entry="Long", stop=stopPriceFinal, limit=targetPriceFinal)
+strategy.exit("Short Exit", from_entry="Short", stop=stopPriceFinal, limit=targetPriceFinal)
+
+// Once flat again mid-day, optionally reset bias so a second setup can form.
+positionJustClosed = strategy.position_size[1] != 0 and strategy.position_size == 0
+if positionJustClosed and not oneTradePerDay
+    bias := ""
+    breakLevel := na
+    upCloseCount := 0
+    downCloseCount := 0
+
+if flattenAtWindowEnd and strategy.position_size != 0 and minutesSinceOpen >= effectiveWindow
+    strategy.close_all(comment="Window flatten")
+
+if newDay and strategy.position_size != 0
+    strategy.close_all(comment="New day safety flatten")
+
+// ───────────────────────────── Alerts ─────────────────────────────
+
+alertcondition(enterLongNow, title="ORB Long Entry", message="{{ticker}} 9:30 ORB long retest entry on {{interval}} at {{close}}")
+alertcondition(enterShortNow, title="ORB Short Entry", message="{{ticker}} 9:30 ORB short retest entry on {{interval}} at {{close}}")
+
+if enterLongNow
+    alert('{"event":"entry","strategy":"orb930","side":"long","symbol":"' + syminfo.ticker + '","price":' + str.tostring(close) + ',"stop":' + str.tostring(stopPriceFinal) + ',"target":' + str.tostring(targetPriceFinal) + ',"time":"' + str.tostring(time) + '"}', alert.freq_once_per_bar_close)
+
+if enterShortNow
+    alert('{"event":"entry","strategy":"orb930","side":"short","symbol":"' + syminfo.ticker + '","price":' + str.tostring(close) + ',"stop":' + str.tostring(stopPriceFinal) + ',"target":' + str.tostring(targetPriceFinal) + ',"time":"' + str.tostring(time) + '"}', alert.freq_once_per_bar_close)
+
+// ───────────────────────────── Plots ─────────────────────────────
+
+plot(showOrLines ? orHigh : na, "Opening Range High", color=color.new(color.blue, 0), style=plot.style_linebr, linewidth=1)
+plot(showOrLines ? orLow : na, "Opening Range Low", color=color.new(color.orange, 0), style=plot.style_linebr, linewidth=1)
+
+tradeEntryPlot = strategy.position_size != 0 ? entryPrice : na
+tradeStopPlot = strategy.position_size != 0 ? stopPriceFinal : na
+tradeTargetPlot = strategy.position_size != 0 ? targetPriceFinal : na
+
+plot(showTradeLevels ? tradeEntryPlot : na, "Entry Price", color=color.new(color.gray, 20), style=plot.style_linebr, linewidth=1)
+plot(showTradeLevels ? tradeStopPlot : na, "Stop Loss", color=color.new(color.red, 0), style=plot.style_linebr, linewidth=2)
+plot(showTradeLevels ? tradeTargetPlot : na, "Take Profit", color=color.new(color.green, 0), style=plot.style_linebr, linewidth=2)
+
+plotshape(enterLongNow, title="Long Entry", style=shape.triangleup, location=location.belowbar,
+     color=color.new(color.green, 0), size=size.small)
+plotshape(enterShortNow, title="Short Entry", style=shape.triangledown, location=location.abovebar,
+     color=color.new(color.red, 0), size=size.small)
+
+if showTradeLevels and enterLongNow
+    label.new(bar_index, stopPriceFinal, "SL " + str.tostring(stopPriceFinal, format.mintick),
+         style=label.style_label_down, color=color.new(color.red, 15), textcolor=color.white, size=size.tiny)
+    label.new(bar_index, targetPriceFinal, "TP " + str.tostring(targetPriceFinal, format.mintick),
+         style=label.style_label_up, color=color.new(color.green, 15), textcolor=color.white, size=size.tiny)
+
+if showTradeLevels and enterShortNow
+    label.new(bar_index, stopPriceFinal, "SL " + str.tostring(stopPriceFinal, format.mintick),
+         style=label.style_label_up, color=color.new(color.red, 15), textcolor=color.white, size=size.tiny)
+    label.new(bar_index, targetPriceFinal, "TP " + str.tostring(targetPriceFinal, format.mintick),
+         style=label.style_label_down, color=color.new(color.green, 15), textcolor=color.white, size=size.tiny)
+
+// ───────────────────────────── Dashboard ─────────────────────────────
+
+var table dash = table.new(position.top_right, 2, 7, border_width=1)
+
+if showDashboard and barstate.islast
+    table.cell(dash, 0, 0, "Bias", bgcolor=color.gray, text_color=color.white)
+    table.cell(dash, 1, 0, bias == "" ? "None yet" : bias == "long" ? "Long" : "Short",
+         bgcolor=bias == "long" ? color.new(color.green, 60) : bias == "short" ? color.new(color.red, 60) : color.new(color.gray, 70))
+
+    table.cell(dash, 0, 1, "OR High", bgcolor=color.gray, text_color=color.white)
+    table.cell(dash, 1, 1, na(orHigh) ? "—" : str.tostring(orHigh, format.mintick))
+
+    table.cell(dash, 0, 2, "OR Low", bgcolor=color.gray, text_color=color.white)
+    table.cell(dash, 1, 2, na(orLow) ? "—" : str.tostring(orLow, format.mintick))
+
+    table.cell(dash, 0, 3, "Minutes Since Open", bgcolor=color.gray, text_color=color.white)
+    table.cell(dash, 1, 3, str.tostring(minutesSinceOpen))
+
+    inWindow = minutesSinceOpen >= 0 and minutesSinceOpen < effectiveWindow
+    table.cell(dash, 0, 4, "In Trading Window", bgcolor=color.gray, text_color=color.white)
+    table.cell(dash, 1, 4, inWindow ? "Yes" : "No",
+         bgcolor=inWindow ? color.new(color.green, 60) : color.new(color.gray, 70))
+
+    table.cell(dash, 0, 5, "Entries Today", bgcolor=color.gray, text_color=color.white)
+    table.cell(dash, 1, 5, entryTakenToday ? "1+" : "0")
+
+    tfOk = timeframe.in_seconds(timeframe.period) <= 60
+    table.cell(dash, 0, 6, "Chart Timeframe", bgcolor=color.gray, text_color=color.white)
+    table.cell(dash, 1, 6, timeframe.period + (tfOk ? "" : " (use 1min)"),
+         bgcolor=tfOk ? color.new(color.green, 60) : color.new(color.orange, 50))
+
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/

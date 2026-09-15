@@ -128,6 +128,14 @@ signals before considering live mode.
 
 - `pine/ProScalpv3.7.pine` — the TradingView strategy, with webhook alerting
   added for bot integration.
+- `pine/ORB_930_Retest.pine` — a separate, standalone Pine strategy (not wired
+  to the bot below, which is crypto/Kraken-specific): a 9:30 AM opening-range
+  breakout + retest scalper for the regular equities/futures cash session,
+  based on the mechanical rules from a Scarface Trades YouTube video. Marks
+  the first N minutes' high/low as the day's range, waits for a directional
+  close beyond it, then enters on a retest that shows a rejection back in the
+  breakout direction, with a risk-based position size and a fixed R-multiple
+  target. Meant to be run/backtested on its own chart (1-minute recommended).
 - `bot/config.py` — all settings, loaded from `.env`.
 - `bot/kraken_client.py` — thin ccxt wrapper (public price data + private orders).
 - `bot/broker.py` — `PaperBroker` (simulated fills) / `LiveBroker` (real orders).
