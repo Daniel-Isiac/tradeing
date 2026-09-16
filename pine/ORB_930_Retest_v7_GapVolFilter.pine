@@ -18,21 +18,26 @@
 // volatility rather than outside it.
 //
 //   FILTER 1 - Opening gap filter: if today's session opens abnormally far
-//   (in ATR terms) from yesterday's close, the whole day's opening range is
-//   built on top of a dislocation rather than orderly price discovery, so
-//   new entries are skipped for that day. Off by default behavior (both
-//   filters disabled) reproduces the original script exactly - useful for
-//   A/B testing against it on the same data.
+//   (as a plain percentage of yesterday's close - deliberately NOT an ATR
+//   multiple, since an overnight gap is a different-scale phenomenon than a
+//   short intraday ATR and comparing the two makes the filter fire on
+//   nearly every day), the whole day's opening range is built on top of a
+//   dislocation rather than orderly price discovery, so new entries are
+//   skipped for that day.
 //
 //   FILTER 2 - Volatility cooldown: this does NOT block the bias from being
 //   set (a real, large, directionally-correct move should still register),
-//   it only delays trusting a retest signal. Any candle whose range is an
-//   outlier relative to ATR marks a "spike" - after that, a retest is only
-//   accepted once BOTH a minimum number of bars have passed AND the retest
-//   candle's own range has calmed back down toward normal. This targets
-//   the actual failure mechanism directly (entering while still inside the
-//   chaos) without discarding the setup outright the way a same-day-only
-//   filter would.
+//   it only delays trusting a retest signal, and only on a day that has
+//   actually had a spike - a normal, spike-free day is never restricted by
+//   this. Any candle whose range is an outlier relative to ATR marks a
+//   "spike" - after that, a retest is only accepted once BOTH a minimum
+//   number of bars have passed AND the retest candle's own range has
+//   calmed back down toward normal. This targets the actual failure
+//   mechanism directly (entering while still inside the chaos) without
+//   discarding the setup outright the way a same-day-only filter would.
+//
+// Turning both filters off reproduces the original (unfiltered) ORB930
+// behavior exactly - useful for A/B testing against it on the same data.
 //
 // Every trade is still framed in dollars-of-risk-to-dollars-of-reward
 // terms - risk-based position sizing (% of equity / stop distance), not a
@@ -76,16 +81,17 @@ requireRejectionCandle = input.bool(true, "Require a rejection-direction close o
      tooltip="On: the retest candle must close back in the breakout direction (e.g. a red close below the level, for a short) - this is the weak price action the strategy looks for before entering. Off: any touch of the level after bias is confirmed triggers an entry (looser, more trades, more noise).")
 
 grpFilter = "Gap / Volatility Filter (ORB 7)"
-atrLen = input.int(14, "ATR Length (used by both filters below)", minval=1, group=grpFilter)
+atrLen = input.int(14, "ATR Length (intrabar candle-size checks only)", minval=1, group=grpFilter,
+     tooltip="Used only by the spike/settled checks below, which compare a single candle's range to recent intrabar noise. Deliberately NOT used for the gap filter - an overnight gap is a different-scale phenomenon than a 14-minute ATR, and comparing the two makes the gap filter fire on nearly every day. The gap filter uses a plain percentage instead.")
 useGapFilter = input.bool(true, "Skip the day if the open gaps too far from yesterday's close", group=grpFilter)
-gapAtrMult = input.float(3.0, "Gap threshold (x ATR)", minval=0.5, step=0.25, group=grpFilter,
-     tooltip="If abs(today's open - yesterday's close) exceeds this many ATRs, the whole day's opening range is treated as built on a dislocation rather than orderly price discovery, and no new entries are taken that day.")
+gapPctThreshold = input.float(3.0, "Gap threshold (% of prior close)", minval=0.1, step=0.1, group=grpFilter,
+     tooltip="If abs(today's open - yesterday's close) / yesterday's close exceeds this percentage, the whole day's opening range is treated as built on a dislocation rather than orderly price discovery, and no new entries are taken that day. A plain percentage avoids the scale mismatch of comparing an overnight gap to a short intraday ATR.")
 useCooldown = input.bool(true, "Require a cooldown after an outsized candle before trusting a retest", group=grpFilter)
 spikeAtrMult = input.float(2.5, "Spike candle threshold (x ATR)", minval=0.5, step=0.25, group=grpFilter,
      tooltip="Any candle (during or after the opening range) whose range exceeds this many ATRs marks a volatility spike.")
 cooldownBars = input.int(3, "Minimum bars after a spike before a retest is accepted", minval=0, group=grpFilter)
 settledAtrMult = input.float(1.5, "Retest candle must itself be calm (x ATR)", minval=0.25, step=0.25, group=grpFilter,
-     tooltip="The retest/entry candle's own range must be back under this many ATRs - both this AND the minimum bar cooldown above must hold. This does not block bias from being set, only delays trusting the retest until things have calmed down. Turn both filters off to reproduce the original (unfiltered) ORB930 behavior exactly.")
+     tooltip="Only enforced on a day that has already had a spike - the retest/entry candle's own range must be back under this many ATRs, in addition to the minimum bar cooldown above. Days with no spike at all are never restricted by this. Turn both filters off to reproduce the original (unfiltered) ORB930 behavior exactly.")
 
 grpRisk = "Risk / Sizing"
 riskPerTradePct = input.float(1.0, "Risk per trade (% of equity)", minval=0.05, step=0.05, group=grpRisk,
@@ -140,7 +146,7 @@ if newDay
     downCloseCount := 0
     entryTakenToday := false
     lastSpikeBar := na
-    gapDayBlocked := useGapFilter and not na(prevCloseForGap) and not na(atrVal[1]) and math.abs(open - prevCloseForGap) > gapAtrMult * atrVal[1]
+    gapDayBlocked := useGapFilter and not na(prevCloseForGap) and prevCloseForGap != 0 and (math.abs(open - prevCloseForGap) / prevCloseForGap * 100) > gapPctThreshold
 
 isSpikeCandle = not na(atrVal) and (high - low) > spikeAtrMult * atrVal
 if isSpikeCandle
@@ -179,7 +185,7 @@ if orLocked and bias == "" and minutesSinceOpen < effectiveWindow and not gapDay
 // ---- Retest & entry ----
 
 cooldownOk = not useCooldown or na(lastSpikeBar) or (bar_index - lastSpikeBar) >= cooldownBars
-settledOk = not useCooldown or na(atrVal) or (high - low) <= settledAtrMult * atrVal
+settledOk = not useCooldown or na(lastSpikeBar) or na(atrVal) or (high - low) <= settledAtrMult * atrVal
 
 longRetest = bias == "long" and low <= breakLevel and (not requireRejectionCandle or (close > breakLevel and close > open)) and cooldownOk and settledOk
 shortRetest = bias == "short" and high >= breakLevel and (not requireRejectionCandle or (close < breakLevel and close < open)) and cooldownOk and settledOk
