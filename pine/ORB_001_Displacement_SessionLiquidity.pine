@@ -1,0 +1,378 @@
+// ORB 001: Displacement Opening Range + Session Liquidity Reversal
+//
+// Three ideas combined into one mechanical strategy:
+//
+//   1. DISPLACEMENT OPENING RANGE - mark the high/low of the first N
+//      minutes after the session open. Instead of trading any close beyond
+//      that range, wait for real displacement: several consecutive
+//      strong-bodied candles in the same direction, with the last one
+//      closing beyond the range by a real distance (in ATR terms), not a
+//      marginal poke through the level.
+//   2. ZONE / RETEST - the candle immediately before the displacement
+//      sequence began (the last opposite-colored candle right before the
+//      push) marks a demand/supply zone, using its full body like an order
+//      block. Entry triggers when price retraces into that zone and either
+//      prints an engulfing candle back in the trend direction, or simply
+//      closes back in the trend direction while touching the zone (the
+//      engulfing version is the higher-quality but rarer read; the simple
+//      "zone holds" version fires far more often).
+//   3. SESSION LIQUIDITY FILTER - session ranges are tracked in UTC (Asian
+//      00:00-08:00, London 08:00-13:00, New York 13:00-21:00 by default -
+//      fixed UTC blocks regardless of the exchange timezone used for the
+//      opening range above, since that's the standard convention and
+//      avoids midnight-wrap issues entirely). If the London session sweeps
+//      one side of the Asian session's range and closes the session having
+//      moved away from that side, that's read as a reversal setup for the
+//      New York session in the OPPOSITE direction of London's push. If
+//      London sweeps BOTH sides of the Asian range, that's read as
+//      continuation instead of reversal. This is used as a directional
+//      filter on the displacement setups above, not a separate entry model.
+//
+// Stop-loss is placed beyond the zone. Position sizing is risk-based (a
+// fixed % of equity divided by the trade's actual stop distance) rather
+// than a flat share/contract count, and the target is a configurable fixed
+// reward multiple of that risk.
+//
+// Recommended: run this on a 5-minute chart, matching the opening-range
+// length default of 15 minutes.
+//
+// NON-REPAINTING: calc_on_every_tick is disabled - every signal locks in at
+// bar close. The session liquidity filter necessarily only "settles" once
+// the London session block has fully closed for the UTC day, which is
+// normal for any session-based read, not a repaint.
+//
+// Past performance in the Strategy Tester is hypothetical and not
+// indicative of future results. Research/education tool only, not
+// financial advice.
+
+//@version=6
+strategy("ORB 001: Displacement + Session Liquidity Reversal", shorttitle="ORB001", overlay=true,
+     calc_on_every_tick=false, process_orders_on_close=true,
+     default_qty_type=strategy.percent_of_equity, default_qty_value=10,
+     initial_capital=25000, commission_type=strategy.commission.cash_per_order,
+     commission_value=0, slippage=1, max_labels_count=500)
+
+// ---- Inputs ----
+
+grpSession = "Opening Range Session"
+sessionTz = input.string("America/New_York", "Exchange Session Timezone", group=grpSession,
+     tooltip="Timezone the opening range and trading window below are measured in. Independent of the UTC session-liquidity blocks in the filter group further down.")
+sessionStartHour = input.int(9, "Session Start Hour (0-23)", minval=0, maxval=23, group=grpSession)
+sessionStartMinute = input.int(30, "Session Start Minute", minval=0, maxval=59, group=grpSession)
+orMinutes = input.int(15, "Opening Range Length (minutes)", minval=1, group=grpSession,
+     tooltip="High/low of the first N minutes after the open. 15 matches a first-15-minute range read on a 5-minute chart, which is the recommended chart timeframe for this script.")
+tradingWindowMinutes = input.int(180, "Stop looking for new entries after (minutes from open)", minval=1, group=grpSession,
+     tooltip="Displacement can take a while to develop and retest, so this window is generous by default. No new entries after it elapses.")
+flattenAtWindowEnd = input.bool(false, "Flatten any open position at window end", group=grpSession)
+
+grpDisp = "Displacement"
+atrLen = input.int(14, "ATR Length", minval=1, group=grpDisp)
+displacementBars = input.int(3, "Consecutive strong candles required", minval=1, maxval=6, group=grpDisp,
+     tooltip="How many consecutive strong-bodied same-direction candles count as real displacement, not just a single lucky close beyond the range.")
+minBodyRatio = input.float(0.5, "Minimum body-to-range ratio for a 'strong' candle", minval=0.1, maxval=0.95, step=0.05, group=grpDisp,
+     tooltip="A candle only counts toward the displacement count if its body is at least this fraction of its own high-low range - filters out indecisive/doji candles from counting as displacement.")
+minDisplacementAtrMult = input.float(0.3, "Minimum close beyond range (x ATR)", minval=0, step=0.1, group=grpDisp,
+     tooltip="The displacement sequence's final candle must close beyond the opening range by at least this many ATRs, so a marginal poke through the level doesn't count as displacement.")
+
+grpZone = "Zone / Retest Entry"
+preferEngulfing = input.bool(true, "Take an engulfing-candle entry at the zone", group=grpZone,
+     tooltip="A candle whose body fully engulfs the prior candle's body, in the trend direction, while touching the zone. The higher-quality but rarer of the two entry reads.")
+allowSimpleHold = input.bool(true, "Also take a simple 'zone holds' entry", group=grpZone,
+     tooltip="Off: only the engulfing pattern above is a valid entry. On: a candle that touches the zone and closes back in the trend direction is also valid - this fires far more often than the engulfing pattern, and is how most real setups actually resolve.")
+
+grpSweep = "Session Liquidity Filter"
+requireSessionBias = input.bool(true, "Only trade with the session liquidity-sweep bias", group=grpSweep,
+     tooltip="See the header comment for the full mechanism. Off: ignore this filter entirely and take every qualifying displacement setup regardless of session read.")
+allowNeutralDays = input.bool(false, "Still trade on days with no clear session read", group=grpSweep,
+     tooltip="On a day where London didn't sweep either side of the Asian range (or the read is otherwise ambiguous), this decides whether to still allow a trade. Off matches the filter's purpose - skip the setups it can't get a read on.")
+asianStartUtc = input.int(0, "Asian session start hour (UTC)", minval=0, maxval=23, group=grpSweep)
+asianEndUtc = input.int(8, "Asian session end hour (UTC)", minval=0, maxval=23, group=grpSweep)
+londonStartUtc = input.int(8, "London session start hour (UTC)", minval=0, maxval=23, group=grpSweep)
+londonEndUtc = input.int(13, "London session end hour (UTC)", minval=0, maxval=23, group=grpSweep)
+
+grpRisk = "Risk / Sizing"
+riskPerTradePct = input.float(1.0, "Risk per trade (% of equity)", minval=0.05, step=0.05, group=grpRisk,
+     tooltip="Position size is derived from this and the trade's actual stop distance (entry vs. beyond the zone) rather than a flat share/contract count.")
+riskMultiple = input.float(2.0, "Reward multiple (x initial risk)", minval=0.5, step=0.1, group=grpRisk)
+stopBufferTicks = input.float(0, "Extra stop buffer beyond the zone (ticks)", minval=0, group=grpRisk)
+oneTradePerDay = input.bool(true, "One trade per day (stop after first setup resolves)", group=grpRisk)
+
+grpDisplay = "Display"
+showOrLines = input.bool(true, "Show opening range lines", group=grpDisplay)
+showAsianRange = input.bool(true, "Show Asian session range lines", group=grpDisplay)
+showZone = input.bool(true, "Show demand/supply zone", group=grpDisplay)
+showTradeLevels = input.bool(true, "Show entry/stop/target lines", group=grpDisplay)
+showDashboard = input.bool(true, "Show dashboard", group=grpDisplay)
+
+// ---- Opening range session tracking ----
+
+barHour = hour(time, sessionTz)
+barMinute = minute(time, sessionTz)
+minutesSinceOpen = (barHour * 60 + barMinute) - (sessionStartHour * 60 + sessionStartMinute)
+effectiveWindow = math.max(tradingWindowMinutes, orMinutes + 1)
+
+dateId = year(time, sessionTz) * 10000 + month(time, sessionTz) * 100 + dayofmonth(time, sessionTz)
+newDay = ta.change(dateId) != 0
+
+atrVal = ta.atr(atrLen)
+
+var float orHigh = na
+var float orLow = na
+var bool  orLocked = false
+var string bias = ""
+var float zoneTop = na
+var float zoneBottom = na
+var int   upStrongCount = 0
+var int   downStrongCount = 0
+var bool  entryTakenToday = false
+
+if newDay
+    orHigh := na
+    orLow := na
+    orLocked := false
+    bias := ""
+    zoneTop := na
+    zoneBottom := na
+    upStrongCount := 0
+    downStrongCount := 0
+    entryTakenToday := false
+
+inOrWindow = minutesSinceOpen >= 0 and minutesSinceOpen < orMinutes
+
+if inOrWindow
+    orHigh := na(orHigh) ? high : math.max(orHigh, high)
+    orLow := na(orLow) ? low : math.min(orLow, low)
+
+if not inOrWindow and minutesSinceOpen >= orMinutes and not orLocked and not na(orHigh)
+    orLocked := true
+
+// ---- Session liquidity tracking (fixed UTC blocks, independent of sessionTz) ----
+
+utcHour = hour(time, "UTC")
+utcDateId = year(time, "UTC") * 10000 + month(time, "UTC") * 100 + dayofmonth(time, "UTC")
+newUtcDay = ta.change(utcDateId) != 0
+
+isAsianHours = utcHour >= asianStartUtc and utcHour < asianEndUtc
+isLondonHours = utcHour >= londonStartUtc and utcHour < londonEndUtc
+
+var float asianHigh = na
+var float asianLow = na
+var bool  asianLocked = false
+var bool  londonSweptHigh = false
+var bool  londonSweptLow = false
+var float londonOpenPrice = na
+var float londonClosePrice = na
+var string sessionBias = "none"
+
+if newUtcDay
+    asianHigh := na
+    asianLow := na
+    asianLocked := false
+    londonSweptHigh := false
+    londonSweptLow := false
+    londonOpenPrice := na
+    londonClosePrice := na
+    sessionBias := "none"
+
+if isAsianHours
+    asianHigh := na(asianHigh) ? high : math.max(asianHigh, high)
+    asianLow := na(asianLow) ? low : math.min(asianLow, low)
+if not isAsianHours and not asianLocked and not na(asianHigh)
+    asianLocked := true
+
+if isLondonHours
+    if na(londonOpenPrice)
+        londonOpenPrice := open
+    londonClosePrice := close
+    if asianLocked
+        if high > asianHigh
+            londonSweptHigh := true
+        if low < asianLow
+            londonSweptLow := true
+
+londonNetBearish = not na(londonOpenPrice) and not na(londonClosePrice) and londonClosePrice < londonOpenPrice
+londonNetBullish = not na(londonOpenPrice) and not na(londonClosePrice) and londonClosePrice > londonOpenPrice
+
+if londonSweptHigh and londonSweptLow
+    sessionBias := londonNetBullish ? "long" : londonNetBearish ? "short" : "none"
+else if londonSweptHigh and londonNetBearish
+    sessionBias := "long"
+else if londonSweptLow and londonNetBullish
+    sessionBias := "short"
+else
+    sessionBias := "none"
+
+allowLongBySession = not requireSessionBias or sessionBias == "long" or (sessionBias == "none" and allowNeutralDays)
+allowShortBySession = not requireSessionBias or sessionBias == "short" or (sessionBias == "none" and allowNeutralDays)
+
+// ---- Displacement detection ----
+
+candleRange = high - low
+isStrongUp = close > open and candleRange > 0 and (close - open) >= minBodyRatio * candleRange
+isStrongDown = close < open and candleRange > 0 and (open - close) >= minBodyRatio * candleRange
+
+if orLocked and bias == "" and minutesSinceOpen < effectiveWindow
+    if isStrongUp
+        upStrongCount := upStrongCount + 1
+        downStrongCount := 0
+    else if isStrongDown
+        downStrongCount := downStrongCount + 1
+        upStrongCount := 0
+    else
+        upStrongCount := 0
+        downStrongCount := 0
+
+    if upStrongCount >= displacementBars and not na(orHigh) and not na(atrVal) and close > orHigh and (close - orHigh) >= minDisplacementAtrMult * atrVal and allowLongBySession
+        bias := "long"
+        zoneTop := math.max(open[displacementBars], close[displacementBars])
+        zoneBottom := math.min(open[displacementBars], close[displacementBars])
+    else if downStrongCount >= displacementBars and not na(orLow) and not na(atrVal) and close < orLow and (orLow - close) >= minDisplacementAtrMult * atrVal and allowShortBySession
+        bias := "short"
+        zoneTop := math.max(open[displacementBars], close[displacementBars])
+        zoneBottom := math.min(open[displacementBars], close[displacementBars])
+
+// ---- Zone retest & entry ----
+
+prevBodyHigh = math.max(open[1], close[1])
+prevBodyLow = math.min(open[1], close[1])
+curBodyHigh = math.max(open, close)
+curBodyLow = math.min(open, close)
+
+isEngulfingBull = close > open and close[1] < open[1] and curBodyHigh >= prevBodyHigh and curBodyLow <= prevBodyLow
+isEngulfingBear = close < open and close[1] > open[1] and curBodyHigh >= prevBodyHigh and curBodyLow <= prevBodyLow
+
+touchesLongZone = not na(zoneTop) and low <= zoneTop
+touchesShortZone = not na(zoneBottom) and high >= zoneBottom
+
+longEngulfTrigger = preferEngulfing and touchesLongZone and isEngulfingBull
+longHoldTrigger = allowSimpleHold and touchesLongZone and close > open and close >= zoneBottom
+shortEngulfTrigger = preferEngulfing and touchesShortZone and isEngulfingBear
+shortHoldTrigger = allowSimpleHold and touchesShortZone and close < open and close <= zoneTop
+
+longRetest = bias == "long" and (longEngulfTrigger or longHoldTrigger)
+shortRetest = bias == "short" and (shortEngulfTrigger or shortHoldTrigger)
+
+canEnter = strategy.position_size == 0 and minutesSinceOpen < effectiveWindow and not (oneTradePerDay and entryTakenToday)
+enterLongNow = canEnter and longRetest
+enterShortNow = canEnter and shortRetest
+
+var float entryPrice = na
+var float stopPriceFinal = na
+var float targetPriceFinal = na
+
+if enterLongNow
+    stopLevel = zoneBottom - stopBufferTicks * syminfo.mintick
+    riskPerShare = math.max(close - stopLevel, syminfo.mintick)
+    riskAmount = strategy.equity * riskPerTradePct / 100
+    qty = riskAmount / riskPerShare
+    strategy.entry("Long", strategy.long, qty=qty)
+    entryPrice := close
+    stopPriceFinal := stopLevel
+    targetPriceFinal := close + riskPerShare * riskMultiple
+    entryTakenToday := true
+
+if enterShortNow
+    stopLevel = zoneTop + stopBufferTicks * syminfo.mintick
+    riskPerShare = math.max(stopLevel - close, syminfo.mintick)
+    riskAmount = strategy.equity * riskPerTradePct / 100
+    qty = riskAmount / riskPerShare
+    strategy.entry("Short", strategy.short, qty=qty)
+    entryPrice := close
+    stopPriceFinal := stopLevel
+    targetPriceFinal := close - riskPerShare * riskMultiple
+    entryTakenToday := true
+
+strategy.exit("Long Exit", from_entry="Long", stop=stopPriceFinal, limit=targetPriceFinal)
+strategy.exit("Short Exit", from_entry="Short", stop=stopPriceFinal, limit=targetPriceFinal)
+
+if flattenAtWindowEnd and strategy.position_size != 0 and minutesSinceOpen >= effectiveWindow
+    strategy.close_all(comment="Window flatten")
+
+if newDay and strategy.position_size != 0
+    strategy.close_all(comment="New day safety flatten")
+
+// ---- Alerts ----
+
+alertcondition(enterLongNow, title="ORB001 Long Entry", message="{{ticker}} ORB001 long zone entry on {{interval}} at {{close}}")
+alertcondition(enterShortNow, title="ORB001 Short Entry", message="{{ticker}} ORB001 short zone entry on {{interval}} at {{close}}")
+
+if enterLongNow
+    alert('{"event":"entry","strategy":"orb001","side":"long","symbol":"' + syminfo.ticker + '","price":' + str.tostring(close) + ',"stop":' + str.tostring(stopPriceFinal) + ',"target":' + str.tostring(targetPriceFinal) + ',"time":"' + str.tostring(time) + '"}', alert.freq_once_per_bar_close)
+
+if enterShortNow
+    alert('{"event":"entry","strategy":"orb001","side":"short","symbol":"' + syminfo.ticker + '","price":' + str.tostring(close) + ',"stop":' + str.tostring(stopPriceFinal) + ',"target":' + str.tostring(targetPriceFinal) + ',"time":"' + str.tostring(time) + '"}', alert.freq_once_per_bar_close)
+
+// ---- Plots ----
+
+plot(showOrLines ? orHigh : na, "Opening Range High", color=color.new(color.blue, 0), style=plot.style_linebr, linewidth=1)
+plot(showOrLines ? orLow : na, "Opening Range Low", color=color.new(color.orange, 0), style=plot.style_linebr, linewidth=1)
+
+plot(showAsianRange ? asianHigh : na, "Asian Session High", color=color.new(color.purple, 40), style=plot.style_linebr, linewidth=1)
+plot(showAsianRange ? asianLow : na, "Asian Session Low", color=color.new(color.purple, 40), style=plot.style_linebr, linewidth=1)
+
+zoneTopPlot = plot(showZone ? zoneTop : na, "Zone Top", color=color.new(color.teal, 20), style=plot.style_linebr, linewidth=1)
+zoneBottomPlot = plot(showZone ? zoneBottom : na, "Zone Bottom", color=color.new(color.teal, 20), style=plot.style_linebr, linewidth=1)
+fill(zoneTopPlot, zoneBottomPlot, color=showZone ? color.new(color.teal, 85) : na, title="Zone Fill")
+
+tradeEntryPlot = strategy.position_size != 0 ? entryPrice : na
+tradeStopPlot = strategy.position_size != 0 ? stopPriceFinal : na
+tradeTargetPlot = strategy.position_size != 0 ? targetPriceFinal : na
+
+plot(showTradeLevels ? tradeEntryPlot : na, "Entry Price", color=color.new(color.gray, 20), style=plot.style_linebr, linewidth=1)
+plot(showTradeLevels ? tradeStopPlot : na, "Stop Loss", color=color.new(color.red, 0), style=plot.style_linebr, linewidth=2)
+plot(showTradeLevels ? tradeTargetPlot : na, "Take Profit", color=color.new(color.green, 0), style=plot.style_linebr, linewidth=2)
+
+plotshape(enterLongNow, title="Long Entry", style=shape.triangleup, location=location.belowbar,
+     color=color.new(color.green, 0), size=size.small)
+plotshape(enterShortNow, title="Short Entry", style=shape.triangledown, location=location.abovebar,
+     color=color.new(color.red, 0), size=size.small)
+
+if showTradeLevels and enterLongNow
+    label.new(bar_index, stopPriceFinal, "SL " + str.tostring(stopPriceFinal, format.mintick),
+         style=label.style_label_down, color=color.new(color.red, 15), textcolor=color.white, size=size.tiny)
+    label.new(bar_index, targetPriceFinal, "TP " + str.tostring(targetPriceFinal, format.mintick),
+         style=label.style_label_up, color=color.new(color.green, 15), textcolor=color.white, size=size.tiny)
+
+if showTradeLevels and enterShortNow
+    label.new(bar_index, stopPriceFinal, "SL " + str.tostring(stopPriceFinal, format.mintick),
+         style=label.style_label_up, color=color.new(color.red, 15), textcolor=color.white, size=size.tiny)
+    label.new(bar_index, targetPriceFinal, "TP " + str.tostring(targetPriceFinal, format.mintick),
+         style=label.style_label_down, color=color.new(color.green, 15), textcolor=color.white, size=size.tiny)
+
+// ---- Dashboard ----
+
+var table dash = table.new(position.top_right, 2, 9, border_width=1)
+
+if showDashboard and barstate.islast
+    table.cell(dash, 0, 0, "Bias", bgcolor=color.gray, text_color=color.white)
+    table.cell(dash, 1, 0, bias == "" ? "None yet" : bias == "long" ? "Long" : "Short",
+         bgcolor=bias == "long" ? color.new(color.green, 60) : bias == "short" ? color.new(color.red, 60) : color.new(color.gray, 70))
+
+    table.cell(dash, 0, 1, "Session Bias", bgcolor=color.gray, text_color=color.white)
+    table.cell(dash, 1, 1, sessionBias == "long" ? "Long" : sessionBias == "short" ? "Short" : "None",
+         bgcolor=sessionBias == "long" ? color.new(color.green, 60) : sessionBias == "short" ? color.new(color.red, 60) : color.new(color.gray, 70))
+
+    table.cell(dash, 0, 2, "Asian High / Low", bgcolor=color.gray, text_color=color.white)
+    table.cell(dash, 1, 2, (na(asianHigh) ? "-" : str.tostring(asianHigh, format.mintick)) + " / " + (na(asianLow) ? "-" : str.tostring(asianLow, format.mintick)))
+
+    table.cell(dash, 0, 3, "London Swept H/L", bgcolor=color.gray, text_color=color.white)
+    table.cell(dash, 1, 3, (londonSweptHigh ? "Yes" : "No") + " / " + (londonSweptLow ? "Yes" : "No"))
+
+    table.cell(dash, 0, 4, "Zone Top / Bottom", bgcolor=color.gray, text_color=color.white)
+    table.cell(dash, 1, 4, na(zoneTop) ? "-" : str.tostring(zoneTop, format.mintick) + " / " + str.tostring(zoneBottom, format.mintick))
+
+    table.cell(dash, 0, 5, "Minutes Since Open", bgcolor=color.gray, text_color=color.white)
+    table.cell(dash, 1, 5, str.tostring(minutesSinceOpen))
+
+    inWindow = minutesSinceOpen >= 0 and minutesSinceOpen < effectiveWindow
+    table.cell(dash, 0, 6, "In Trading Window", bgcolor=color.gray, text_color=color.white)
+    table.cell(dash, 1, 6, inWindow ? "Yes" : "No",
+         bgcolor=inWindow ? color.new(color.green, 60) : color.new(color.gray, 70))
+
+    table.cell(dash, 0, 7, "Entries Today", bgcolor=color.gray, text_color=color.white)
+    table.cell(dash, 1, 7, entryTakenToday ? "1+" : "0")
+
+    table.cell(dash, 0, 8, "Chart Timeframe", bgcolor=color.gray, text_color=color.white)
+    table.cell(dash, 1, 8, timeframe.period)
+
+// This Pine Script code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/

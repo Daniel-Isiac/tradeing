@@ -177,13 +177,28 @@ signals before considering live mode.
   failed trades across several tickers, all of which shared the same
   shape (chasing a sudden, still-repricing move and getting stopped out
   within a few bars by the ongoing chaos of that same move). Filter 1
-  skips the whole day if the open gaps too far (in ATR terms) from the
-  prior close. Filter 2 doesn't block bias from being set, but delays
-  trusting a retest until both a minimum bar cooldown has passed and the
-  retest candle's own range has calmed back toward normal after an
-  outsized ("spike") candle. Both filters default on but toggle off
-  individually — turning both off reproduces the original ORB930
+  skips the whole day if the open gaps too far, as a percentage of the
+  prior close (deliberately not an ATR multiple, which mismatches an
+  overnight gap's scale against a short intraday ATR). Filter 2 doesn't
+  block bias from being set, but delays trusting a retest until both a
+  minimum bar cooldown has passed and the retest candle's own range has
+  calmed back toward normal after an outsized ("spike") candle, and only
+  on a day that actually had a spike. Both filters default on but toggle
+  off individually — turning both off reproduces the original ORB930
   behavior exactly, for A/B testing on the same data.
+- `pine/ORB_001_Displacement_SessionLiquidity.pine` — "ORB 001": a
+  different opening-range strategy combining three ideas. (1) Displacement:
+  instead of trading any close beyond the opening range, waits for several
+  consecutive strong-bodied candles in the same direction whose last close
+  clears the range by a real ATR distance. (2) Zone/retest: the opposite-
+  colored candle right before the displacement sequence marks a demand/
+  supply zone (order-block style, full body); entry triggers on an
+  engulfing candle or a simple "zone holds" close back in the trend
+  direction. (3) Session liquidity filter: Asian/London/New York ranges
+  tracked in fixed UTC blocks — if London sweeps one side of the Asian
+  range and closes moving away from it, that's read as a reversal setup in
+  the opposite direction for the New York session; sweeping both sides
+  reads as continuation instead. Recommended on a 5-minute chart.
 
 ## Multi-ticker backtesting (`backtest/`)
 
