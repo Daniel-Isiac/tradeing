@@ -172,6 +172,18 @@ signals before considering live mode.
   state machine waits for a retest of the level (tolerance in ATR) before
   entering, with an ATR-buffered stop and a fixed reward multiple. Ported
   to Python in `backtest/` for multi-ticker backtesting (see below).
+- `pine/ORB_930_Retest_v7_GapVolFilter.pine` — "ORB 7": the original 9:30
+  ORB retest scalper plus two optional filters built from reviewing real
+  failed trades across several tickers, all of which shared the same
+  shape (chasing a sudden, still-repricing move and getting stopped out
+  within a few bars by the ongoing chaos of that same move). Filter 1
+  skips the whole day if the open gaps too far (in ATR terms) from the
+  prior close. Filter 2 doesn't block bias from being set, but delays
+  trusting a retest until both a minimum bar cooldown has passed and the
+  retest candle's own range has calmed back toward normal after an
+  outsized ("spike") candle. Both filters default on but toggle off
+  individually — turning both off reproduces the original ORB930
+  behavior exactly, for A/B testing on the same data.
 
 ## Multi-ticker backtesting (`backtest/`)
 
