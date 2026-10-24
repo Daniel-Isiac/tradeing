@@ -136,3 +136,13 @@ signals before considering live mode.
 - `bot/monitor.py` — background loop that checks the open position against its bracket.
 - `bot/webhook_server.py` — FastAPI app receiving TradingView alerts.
 - `bot/main.py` — entrypoint (`python -m bot.main`).
+
+## Other strategies
+
+- `pine/OILiquidationClusterPyramid.pine` — estimates Coinglass-style
+  liquidation clusters from TradingView's open-interest feed (`<SYMBOL>_OI`,
+  so run it on a perp chart such as `BINANCE:ETHUSDT.P`), then fades price
+  into a cluster with a 1-2-3 scaled limit pyramid (tip at cluster middle,
+  base 0.1% beyond it), a stop 0.5% past the base, a 0.4% trailing stop, and
+  a final target at VWAP / the move's origin. Backtest-only for now: it is
+  not wired to the webhook bot, which handles single entries.

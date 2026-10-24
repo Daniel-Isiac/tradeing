@@ -1,0 +1,343 @@
+// OI Liquidation Cluster Pyramid
+//
+// Approximates a Coinglass-style liquidation heatmap from TradingView's own
+// open-interest feed, then fades price as it runs into a liquidity cluster
+// with a 1-2-3 scaled limit-order pyramid.
+//
+// HOW THE MAP IS BUILT (an estimate, not Coinglass's proprietary data):
+//   * Every bar where open interest RISES, the new OI (x price = notional) is
+//     treated as fresh positions opened around hlc3. Every new contract has a
+//     long and a short side, so half goes to each.
+//   * Each side is spread across leverage tiers (10x/25x/50x/100x by default),
+//     and the estimated liquidation price for each tier gets that notional:
+//         long  liq = entry * (1 - 1/lev + mmr)
+//         short liq = entry * (1 + 1/lev - mmr)
+//   * Levels are bucketed into log-price bins (0.1% wide by default).
+//   * When OI FALLS, every level is scaled down by the same ratio (positions
+//     closed), and all levels decay with a configurable half-life.
+//   * When price trades through a bin, that liquidity is considered taken
+//     (liquidated) and the bin is cleared - same as the heatmap bands that
+//     stop once price runs through them.
+//
+// CLUSTERS: within +/- scan range of price, a bin whose liquidity is at least
+// "Liquidity threshold" x the largest bin is a cluster core; the cluster
+// extends over neighbouring bins above "edge ratio" x that threshold. The
+// nearest cluster above price and the nearest below price are tracked.
+//
+// TRADE (fade the sweep):
+//   * Price trades up INTO the cluster above -> sell pyramid.
+//     Price trades down INTO the cluster below -> buy pyramid.
+//   * Tip    = cluster middle (liquidity-weighted)           qty x1
+//     Middle = halfway between tip and base                  qty x2
+//     Base   = 0.1% beyond the far edge of the cluster        qty x3
+//   * Stop loss  = 0.5% beyond the base (applies to all three orders).
+//   * Trailing   = 0.4% trail, activating once price is 0.4% past the
+//                  average entry.
+//   * Final TP   = where price was before it reached the cluster: VWAP by
+//                  default, or the swing origin of the move (lowest low /
+//                  highest high over a lookback).
+//   * Unfilled orders are cancelled when the trade closes, when they expire,
+//     or if price hits the stop or target before anything filled.
+//
+// DATA NOTE: OI comes from "<EXCHANGE>:<TICKER>_OI" (e.g. BINANCE:ETHUSDT.P_OI),
+// which only exists for perpetual/futures symbols and has limited history on
+// TradingView. If it's missing, the script can fall back to volume as a rough
+// proxy (no OI-drop handling in that case). Use it on the perp chart.
+
+//@version=6
+strategy("OI Liquidation Cluster Pyramid", shorttitle="OI LiqPyramid", overlay=true,
+     pyramiding=3, calc_on_every_tick=false, process_orders_on_close=false,
+     default_qty_type=strategy.fixed, default_qty_value=1,
+     initial_capital=10000, commission_type=strategy.commission.percent, commission_value=0.04,
+     slippage=1, max_boxes_count=500)
+
+// ───────────────────────────── Inputs ─────────────────────────────
+grpOI = "Open interest"
+oiOverride     = input.string("", "OI symbol override", group=grpOI, tooltip="Leave blank to use the chart symbol + \"_OI\", e.g. BINANCE:ETHUSDT.P_OI")
+useVolFallback = input.bool(true, "Fall back to volume if no OI data", group=grpOI)
+
+grpLev = "Leverage model"
+lev1 = input.float(10,  "Tier 1 leverage", minval=1, inline="t1", group=grpLev)
+w1   = input.float(0.20, "weight", minval=0, step=0.05, inline="t1", group=grpLev)
+lev2 = input.float(25,  "Tier 2 leverage", minval=1, inline="t2", group=grpLev)
+w2   = input.float(0.30, "weight", minval=0, step=0.05, inline="t2", group=grpLev)
+lev3 = input.float(50,  "Tier 3 leverage", minval=1, inline="t3", group=grpLev)
+w3   = input.float(0.30, "weight", minval=0, step=0.05, inline="t3", group=grpLev)
+lev4 = input.float(100, "Tier 4 leverage", minval=1, inline="t4", group=grpLev)
+w4   = input.float(0.20, "weight", minval=0, step=0.05, inline="t4", group=grpLev)
+mmr  = input.float(0.5, "Maintenance margin %", minval=0, step=0.1, group=grpLev) / 100
+
+grpMap = "Liquidity map"
+binPct    = input.float(0.1, "Bin size %", minval=0.01, step=0.01, group=grpMap)
+halfLife  = input.int(288, "Decay half-life (bars)", minval=1, group=grpMap, tooltip="288 bars = 24h on a 5m chart")
+scanPct   = input.float(5.0, "Scan range +/- %", minval=0.5, step=0.5, group=grpMap)
+thr       = input.float(0.85, "Liquidity threshold (x max bin)", minval=0.05, maxval=1, step=0.05, group=grpMap)
+edgeRatio = input.float(0.5, "Cluster edge ratio (x threshold)", minval=0.1, maxval=1, step=0.05, group=grpMap)
+warmup    = input.int(300, "Warm-up bars before trading", minval=0, group=grpMap)
+
+grpTrade = "Pyramid"
+allowLong  = input.bool(true, "Allow longs (clusters below)", group=grpTrade)
+allowShort = input.bool(true, "Allow shorts (clusters above)", group=grpTrade)
+unitQty    = input.float(1, "Unit size (contracts)", minval=0, step=0.01, group=grpTrade)
+mTip       = input.float(1, "Tip size (x unit)", minval=0, inline="sz", group=grpTrade)
+mMid       = input.float(2, "Middle", minval=0, inline="sz", group=grpTrade)
+mBase      = input.float(3, "Base", minval=0, inline="sz", group=grpTrade)
+beyondPct  = input.float(0.1, "Base beyond cluster %", minval=0, step=0.05, group=grpTrade) / 100
+slPct      = input.float(0.5, "Stop beyond base %", minval=0.01, step=0.05, group=grpTrade) / 100
+trailPct   = input.float(0.4, "Trailing stop %", minval=0.01, step=0.05, group=grpTrade) / 100
+trailActPct = input.float(0.4, "Trail activates after %", minval=0, step=0.05, group=grpTrade) / 100
+tpMode     = input.string("VWAP", "Final take profit", options=["VWAP", "Move origin"], group=grpTrade)
+originLen  = input.int(20, "Move origin lookback (bars)", minval=2, group=grpTrade)
+expiryBars = input.int(30, "Cancel unfilled orders after (bars)", minval=1, group=grpTrade)
+
+grpVis = "Visuals"
+showProfile = input.bool(true, "Show liquidity profile on last bar", group=grpVis)
+profWidth   = input.int(40, "Profile width (bars)", minval=5, maxval=200, group=grpVis)
+
+// ───────────────────────────── Bin helpers ─────────────────────────────
+logStep = math.log(1 + binPct / 100)
+f_key(float p) => int(math.round(math.log(p) / logStep))
+f_px(int k)    => math.exp(k * logStep)
+f_lo(int k)    => math.exp((k - 0.5) * logStep)
+f_hi(int k)    => math.exp((k + 0.5) * logStep)
+
+f_add(map<int, float> m, float p, float amt) =>
+    if p > 0 and amt > 0
+        k = f_key(p)
+        m.put(k, nz(m.get(k)) + amt)
+
+// ───────────────────────────── Open interest ─────────────────────────────
+oiTicker = oiOverride != "" ? oiOverride : syminfo.prefix + ":" + syminfo.ticker + "_OI"
+oi       = request.security(oiTicker, timeframe.period, close, ignore_invalid_symbol=true)
+hasOI    = not na(oi) and not na(oi[1]) and oi[1] > 0
+
+vwap       = ta.vwap(hlc3)
+originLow  = ta.lowest(low, originLen)
+originHigh = ta.highest(high, originLen)
+
+// Liquidity map. Values are stored divided by a global multiplier g so that
+// decay / OI-drop scaling is O(1) per bar: effective value = stored * g.
+var map<int, float> liq = map.new<int, float>()
+var float g = 1.0
+decay = math.pow(0.5, 1.0 / halfLife)
+
+// Cluster state (computed at the end of the previous bar)
+var float upBot = na
+var float upTop = na
+var float upMid = na
+var float dnBot = na
+var float dnTop = na
+var float dnMid = na
+
+// Trade state
+var bool  armed    = false
+var bool  filled   = false
+var int   dir      = 0     // 1 = long, -1 = short
+var int   armBar   = na
+var int   resetBar = na
+var float tTip     = na
+var float tMidPx   = na
+var float tBase    = na
+var float tStop    = na
+var float tTarget  = na
+
+// ───────────────────────────── 1. Manage the active trade ─────────────────────────────
+if armed
+    if strategy.position_size != 0
+        filled := true
+    // Keep a live VWAP target, but never let it cross to the losing side of the tip
+    if tpMode == "VWAP"
+        if (dir == 1 and vwap > tTip) or (dir == -1 and vwap < tTip)
+            tTarget := vwap
+    closedOut = filled and strategy.position_size == 0
+    expired   = not filled and bar_index - armBar >= expiryBars
+    invalid   = not filled and (dir == 1 ? (low <= tStop or high >= tTarget) : (high >= tStop or low <= tTarget))
+    if closedOut or expired or invalid
+        strategy.cancel_all()
+        armed    := false
+        filled   := false
+        dir      := 0
+        resetBar := bar_index
+
+// ───────────────────────────── 2. Price moving into a cluster ─────────────────────────────
+canTrade = not armed and strategy.position_size == 0 and bar_index > warmup and (na(resetBar) or bar_index > resetBar)
+if canTrade
+    shortHit = allowShort and not na(upBot) and high >= upBot
+    longHit  = allowLong  and not na(dnTop) and low  <= dnTop
+    if shortHit and not longHit
+        tip  = upMid
+        base = upTop * (1 + beyondPct)
+        tgt  = tpMode == "VWAP" ? vwap : originLow
+        // Skip if price already blew through the base or the target makes no sense
+        if close < base and tgt < tip
+            armed   := true
+            dir     := -1
+            armBar  := bar_index
+            tTip    := tip
+            tBase   := base
+            tMidPx  := (tip + base) / 2
+            tStop   := base * (1 + slPct)
+            tTarget := tgt
+            strategy.entry("S1", strategy.short, qty=unitQty * mTip,  limit=tTip)
+            strategy.entry("S2", strategy.short, qty=unitQty * mMid,  limit=tMidPx)
+            strategy.entry("S3", strategy.short, qty=unitQty * mBase, limit=tBase)
+    else if longHit and not shortHit
+        tip  = dnMid
+        base = dnBot * (1 - beyondPct)
+        tgt  = tpMode == "VWAP" ? vwap : originHigh
+        if close > base and tgt > tip
+            armed   := true
+            dir     := 1
+            armBar  := bar_index
+            tTip    := tip
+            tBase   := base
+            tMidPx  := (tip + base) / 2
+            tStop   := base * (1 - slPct)
+            tTarget := tgt
+            strategy.entry("L1", strategy.long, qty=unitQty * mTip,  limit=tTip)
+            strategy.entry("L2", strategy.long, qty=unitQty * mMid,  limit=tMidPx)
+            strategy.entry("L3", strategy.long, qty=unitQty * mBase, limit=tBase)
+
+// Exits: one per pyramid leg, refreshed every bar (stop, final TP, trailing).
+// Exits placed for legs that haven't filled yet simply wait for their entry.
+if armed
+    avg      = strategy.position_size != 0 ? strategy.position_avg_price : tTip
+    actPx    = dir == 1 ? avg * (1 + trailActPct) : avg * (1 - trailActPct)
+    offTicks = math.max(1, math.round(avg * trailPct / syminfo.mintick))
+    pfx      = dir == 1 ? "L" : "S"
+    for i = 1 to 3
+        eid = pfx + str.tostring(i)
+        strategy.exit("X" + eid, eid, stop=tStop, limit=tTarget, trail_price=actPx, trail_offset=offTicks)
+
+// ───────────────────────────── 3. Update the liquidity map ─────────────────────────────
+// Price traded through these bins this bar -> that liquidity is gone.
+for k = f_key(low) to f_key(high)
+    if liq.contains(k)
+        liq.remove(k)
+
+g := g * decay
+if hasOI and oi < oi[1]
+    g := g * (oi / oi[1])
+
+newNotional = hasOI ? math.max(oi - oi[1], 0) * hlc3 : (na(oi) and useVolFallback ? nz(volume) * hlc3 : 0.0)
+wSum = w1 + w2 + w3 + w4
+if newNotional > 0 and wSum > 0
+    side = newNotional * 0.5 / wSum / g
+    e = hlc3
+    f_add(liq, e * (1 - 1 / lev1 + mmr), side * w1)
+    f_add(liq, e * (1 - 1 / lev2 + mmr), side * w2)
+    f_add(liq, e * (1 - 1 / lev3 + mmr), side * w3)
+    f_add(liq, e * (1 - 1 / lev4 + mmr), side * w4)
+    f_add(liq, e * (1 + 1 / lev1 - mmr), side * w1)
+    f_add(liq, e * (1 + 1 / lev2 - mmr), side * w2)
+    f_add(liq, e * (1 + 1 / lev3 - mmr), side * w3)
+    f_add(liq, e * (1 + 1 / lev4 - mmr), side * w4)
+
+// Fold g back into stored values before it underflows, and prune dust.
+if g < 1e-30 or bar_index % 1000 == 0
+    ks = liq.keys()
+    mxAll = 0.0
+    for k in ks
+        mxAll := math.max(mxAll, liq.get(k) * g)
+    for k in ks
+        v = liq.get(k) * g
+        if v <= mxAll * 1e-6
+            liq.remove(k)
+        else
+            liq.put(k, v)
+    g := 1.0
+
+// ───────────────────────────── 4. Find clusters around price ─────────────────────────────
+kC    = f_key(close)
+nHalf = math.max(2, int(math.ceil(math.log(1 + scanPct / 100) / logStep)))
+n     = 2 * nHalf + 1
+vals  = array.new<float>(n, 0.0)
+mx    = 0.0
+for i = 0 to n - 1
+    v = nz(liq.get(kC - nHalf + i)) * g
+    vals.set(i, v)
+    mx := math.max(mx, v)
+
+upBot := na
+upTop := na
+upMid := na
+dnBot := na
+dnTop := na
+dnMid := na
+
+if mx > 0
+    core = thr * mx
+    edge = core * edgeRatio
+    // Nearest cluster above price
+    int c = -1
+    for i = nHalf + 1 to n - 1
+        if vals.get(i) >= core
+            c := i
+            break
+    if c >= 0
+        a = c
+        b = c
+        while a - 1 > nHalf and vals.get(a - 1) >= edge
+            a -= 1
+        while b + 1 <= n - 1 and vals.get(b + 1) >= edge
+            b += 1
+        sw = 0.0
+        sp = 0.0
+        for i = a to b
+            sw += vals.get(i)
+            sp += vals.get(i) * f_px(kC - nHalf + i)
+        upBot := f_lo(kC - nHalf + a)
+        upTop := f_hi(kC - nHalf + b)
+        upMid := sp / sw
+    // Nearest cluster below price
+    int d = -1
+    for j = 0 to nHalf - 1
+        i = nHalf - 1 - j
+        if vals.get(i) >= core
+            d := i
+            break
+    if d >= 0
+        a = d
+        b = d
+        while a - 1 >= 0 and vals.get(a - 1) >= edge
+            a -= 1
+        while b + 1 < nHalf and vals.get(b + 1) >= edge
+            b += 1
+        sw = 0.0
+        sp = 0.0
+        for i = a to b
+            sw += vals.get(i)
+            sp += vals.get(i) * f_px(kC - nHalf + i)
+        dnBot := f_lo(kC - nHalf + a)
+        dnTop := f_hi(kC - nHalf + b)
+        dnMid := sp / sw
+
+// ───────────────────────────── Plots ─────────────────────────────
+pUT = plot(upTop, "Cluster above - top",    color=color.new(color.red, 40),   style=plot.style_linebr)
+pUB = plot(upBot, "Cluster above - bottom", color=color.new(color.red, 40),   style=plot.style_linebr)
+pDT = plot(dnTop, "Cluster below - top",    color=color.new(color.green, 40), style=plot.style_linebr)
+pDB = plot(dnBot, "Cluster below - bottom", color=color.new(color.green, 40), style=plot.style_linebr)
+fill(pUT, pUB, color=color.new(color.red, 85),   title="Cluster above")
+fill(pDT, pDB, color=color.new(color.green, 85), title="Cluster below")
+plot(vwap, "VWAP", color=color.new(color.orange, 0))
+
+plot(armed ? tTip    : na, "Tip order",    color=color.aqua,   style=plot.style_linebr)
+plot(armed ? tMidPx  : na, "Middle order", color=color.blue,   style=plot.style_linebr)
+plot(armed ? tBase   : na, "Base order",   color=color.purple, style=plot.style_linebr, linewidth=2)
+plot(armed ? tStop   : na, "Stop loss",    color=color.red,    style=plot.style_linebr, linewidth=2)
+plot(armed ? tTarget : na, "Final TP",     color=color.lime,   style=plot.style_linebr, linewidth=2)
+
+// Heatmap-style liquidity profile to the right of the last bar
+var array<box> prof = array.new<box>()
+if showProfile and barstate.islast
+    for bx in prof
+        bx.delete()
+    prof.clear()
+    if mx > 0
+        for i = 0 to n - 1
+            v = vals.get(i)
+            if v > mx * 0.02
+                k   = kC - nHalf + i
+                w   = math.max(1, int(math.round(profWidth * v / mx)))
+                col = color.from_gradient(v, 0, mx, color.new(#3b0a6b, 30), color.new(#f5f500, 0))
+                prof.push(box.new(bar_index + 3, f_hi(k), bar_index + 3 + w, f_lo(k), border_color=col, bgcolor=col))
